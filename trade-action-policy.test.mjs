@@ -64,3 +64,55 @@ test('definitively rejected actions permit corrections with fresh retry identiti
   await policy.call('register_customer', {customer: {...customer, fullName: 'Corrected Name'}, customerConfirmed: true});
   assert.equal(calls.length, 2); assert.notEqual(calls[0].args.requestKey, calls[1].args.requestKey);
 });
+
+test('preparation holds exact details without writing; confirmation submits once without reconstructing contacts', async () => {
+  const {policy, calls} = fixture(); await ready(policy);
+  const {customerConfirmed: _confirmation, ...details} = booking;
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'PREPARATION_REQUIRED');
+  const prepared = await policy.prepare(details);
+  assert.equal(prepared.status, 'READY_FOR_CONFIRMATION');
+  assert.deepEqual(prepared.summary.customer, customer);
+  assert.equal(calls.filter(call => call.name === 'create_inspection_request').length, 0);
+  details.customer = {...customer, email: 'changed-outside@example.test'};
+  assert.equal((await policy.submit({customerConfirmed: false})).status, 'CONFIRMATION_REQUIRED');
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'PENDING_REVIEW');
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'PENDING_REVIEW');
+  const writes = calls.filter(call => call.name === 'create_inspection_request');
+  assert.equal(writes.length, 1); assert.deepEqual(writes[0].args.customer, customer);
+});
+
+test('failed corrected preparation cannot submit stale details and uncertain prepared writes never duplicate', async () => {
+  const {policy, calls} = fixture({uncertain: true}); await ready(policy);
+  const {customerConfirmed: _confirmation, ...details} = booking;
+  await policy.prepare(details);
+  const invalid = await policy.prepare({...details, customer: {...customer, email: 'bad'}});
+  assert.equal(invalid.status, 'REJECTED');
+  assert.deepEqual(invalid.invalidFields, ['email']);
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'PREPARATION_REQUIRED');
+  assert.equal(calls.filter(call => call.name === 'create_inspection_request').length, 0);
+  await policy.prepare(details);
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'UNKNOWN');
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'UNKNOWN');
+  await policy.prepare({...details, customerNotes: 'bypass attempt'});
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'PREPARATION_REQUIRED');
+  assert.equal(calls.filter(call => call.name === 'create_inspection_request').length, 1);
+});
+
+test('advice can prepare and submit without a published service while retaining availability and confirmation gates', async () => {
+  const {policy, calls} = fixture();
+  const {customerConfirmed: _confirmation, ...details} = booking;
+  const advice = {...details, requestType: 'custom_quote', serviceId: null, customRequest: {title: 'Need advice on a recurring fault', description: 'Happens after rain.'}};
+  assert.equal((await policy.prepare(advice)).status, 'AVAILABILITY_REQUIRED');
+  await policy.call('get_available_slots', {from: '2099-11-05', to: '2099-11-05'});
+  assert.equal((await policy.prepare({...advice, serviceId: 'service-a'})).status, 'REJECTED');
+  assert.equal((await policy.prepare({...advice, customRequest: {title: 'ab'}})).status, 'REJECTED');
+  assert.equal((await policy.prepare({...advice, customRequest: {title: 'Valid scope', description: 'x'.repeat(1501)}})).status, 'REJECTED');
+  assert.equal((await policy.prepare(advice)).status, 'READY_FOR_CONFIRMATION');
+  assert.equal((await policy.submit({customerConfirmed: false})).status, 'CONFIRMATION_REQUIRED');
+  assert.equal((await policy.submit({customerConfirmed: true})).status, 'PENDING_REVIEW');
+  await policy.submit({customerConfirmed: true});
+  const sent = calls.filter(call => call.name === 'create_inspection_request');
+  assert.equal(sent.length, 1); assert.equal(sent[0].args.requestType, 'custom_quote');
+  assert.equal(sent[0].args.serviceId, null); assert.deepEqual(sent[0].args.customRequest, advice.customRequest);
+  assert.equal(calls.some(call => call.name === 'list_services'), false);
+});
