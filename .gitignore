@@ -1,0 +1,32 @@
+# Installed dependencies
+node_modules/
+
+# Private environment files; only the placeholder template is public
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*service-account*.json
+*serviceAccount*.json
+
+# Caller data, recordings and runtime logs
+transcripts/
+*.wav
+*.mp3
+*.pcm
+*.ulaw
+*.log
+
+# Old code snapshots and recovery packages
+*.before-*.mjs
+*.voice-only.mjs
+*.bak
+*.zip
+*.tar.gz
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

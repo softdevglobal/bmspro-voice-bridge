@@ -1,0 +1,9 @@
+; Append this unique section to /etc/asterisk/websocket_client.conf.
+[bmspro-media]
+type=websocket_client
+uri=ws://127.0.0.1:8787/media
+protocols=media
+connection_type=per_call_config
+connection_timeout=5000
+reconnect_attempts=0
+tls_enabled=no
