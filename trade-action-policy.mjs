@@ -23,12 +23,24 @@ const contactKey = value => canonical({email: value.email, phone: value.phone});
 /** Per-call prerequisites, references and retry identity. Models never supply request keys. */
 export function createTradeActionPolicy(inventory, remote) {
   const services = new Set(), customers = new Map(), checks = [], writes = new Map();
+  let prepared = null;
   const names = [...baseTools, ...['find_customer', 'get_available_slots'].filter(name => inventory.has(name))];
   if (inventory.has('find_customer') && inventory.has('register_customer')) names.push('register_customer');
   if (inventory.has('find_customer') && inventory.has('get_available_slots') && inventory.has('create_inspection_request')) names.push('create_inspection_request');
-  return {
+  const policy = {
     names,
-    async call(name, raw) {
+    async prepare(raw) {
+      prepared = null;
+      if (!object(raw) || Object.hasOwn(raw, 'customerConfirmed')) return rejected('Prepare the collected details without a confirmation flag.');
+      return policy.call('create_inspection_request', {...raw, customerConfirmed: true}, {prepareOnly: true});
+    },
+    async submit(raw) {
+      if (!only(raw, ['customerConfirmed'])) return rejected('Submit only the confirmation flag; reuse the prepared details without asking the caller again.');
+      if (raw.customerConfirmed !== true) return {status: 'CONFIRMATION_REQUIRED', message: 'Submit only after the caller explicitly agrees to send the prepared request.'};
+      if (!prepared) return {status: 'PREPARATION_REQUIRED', message: 'Prepare the details already collected in this call first. Do not restart name, phone or email questions unless preparation identifies an actual missing or invalid field.'};
+      return policy.call('create_inspection_request', structuredClone(prepared));
+    },
+    async call(name, raw, {prepareOnly = false} = {}) {
       if (!names.includes(name)) return rejected('Tool unavailable. No action was performed.');
       if (!object(raw) || ['businessId', 'slug', 'requestKey', 'status'].some(key => Object.hasOwn(raw, key)))
         return rejected('Use only advertised arguments; business and request identity are server-controlled.');
@@ -46,13 +58,33 @@ export function createTradeActionPolicy(inventory, remote) {
       } else {
         if (raw.customerConfirmed !== true) return {status: 'CONFIRMATION_REQUIRED', message: 'Read back the details and obtain explicit confirmation before this action.'};
         const customer = contact(raw.customer, true);
-        if (!customer) return rejected('Ask for a valid full name, email and phone; then read back and reconfirm.');
+        if (!customer) {
+          const value = object(raw.customer) ? raw.customer : {};
+          const invalidFields = [];
+          if (typeof value.fullName !== 'string' || value.fullName.trim().length < 2 || value.fullName.trim().length > 200) invalidFields.push('fullName');
+          if (typeof value.email !== 'string' || value.email.trim().length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.email.trim())) invalidFields.push('email');
+          if (typeof value.phone !== 'string' || !/^\d{6,15}$/.test(value.phone.replace(/\D/g, ''))) invalidFields.push('phone');
+          return {status: 'REJECTED', code: 'INVALID_CUSTOMER_DETAILS', invalidFields: invalidFields.length ? invalidFields : ['customer'],
+            message: 'Correct only the listed invalid fields using the existing call context first. Ask a targeted clarification only if the caller must supply a correction. Do not ask for all contact details again.'};
+        }
         if (name === 'register_customer') {
           if (!only(raw, ['customerConfirmed', 'customer'])) return rejected('Use only the advertised customer registration fields.');
           args = {customerConfirmed: true, customer};
         } else {
-          if (!only(raw, ['customerConfirmed', 'serviceId', 'customerId', 'customer', 'address', 'preferredSlots', 'budgetAud', 'customerNotes']) || !services.has(raw.serviceId))
-            return rejected('List services in this call and choose a returned service before booking.');
+          if (!only(raw, ['customerConfirmed', 'requestType', 'serviceId', 'customRequest', 'customerId', 'customer', 'address', 'preferredSlots', 'budgetAud', 'customerNotes']))
+            return rejected('Use only the advertised inspection fields.');
+          const requestType = raw.requestType === undefined ? 'existing_service' : raw.requestType;
+          let serviceId = null, customRequest = null;
+          if (requestType === 'existing_service') {
+            if (!services.has(raw.serviceId) || raw.customRequest != null) return rejected('List services in this call and choose a returned service. Do not combine a service request with a custom request.');
+            serviceId = raw.serviceId;
+          } else if (requestType === 'custom_quote') {
+            const scope = raw.customRequest;
+            if (raw.serviceId != null || !only(scope, ['title', 'description']) || typeof scope.title !== 'string' || scope.title.trim().length < 3 || scope.title.trim().length > 120 ||
+                (scope.description != null && (typeof scope.description !== 'string' || scope.description.trim().length > 1500)))
+              return rejected('For advice, collect a scope of work of 3-120 characters and an optional description up to 1500 characters. Use no service reference; never invent one.');
+            customRequest = {title: scope.title.trim(), description: scope.description?.trim() || ''};
+          } else return rejected('Choose existing_service or custom_quote (not sure / need advice).');
           const address = raw.address;
           if (!only(address, ['street', 'suburb', 'state', 'postcode']) || typeof address.street !== 'string' || address.street.length > 300 ||
               typeof address.suburb !== 'string' || !address.suburb.trim() || address.suburb.length > 200 || typeof address.state !== 'string' || !address.state.trim() || address.state.length > 100 || !/^\d{4}$/.test(address.postcode))
@@ -66,7 +98,7 @@ export function createTradeActionPolicy(inventory, remote) {
           const budgetAud = raw.budgetAud ?? null, customerNotes = raw.customerNotes ?? '';
           if ((budgetAud !== null && (typeof budgetAud !== 'number' || !Number.isFinite(budgetAud) || budgetAud <= 0 || budgetAud > 99999999)) || typeof customerNotes !== 'string' || customerNotes.length > 2000)
             return rejected('Check the optional budget and notes before submitting.');
-          args = {customerConfirmed: true, serviceId: raw.serviceId, customerId, customer,
+          args = {customerConfirmed: true, requestType, serviceId, customRequest, customerId, customer,
             address: {street: address.street.trim(), suburb: address.suburb.trim(), state: address.state.trim(), postcode: address.postcode},
             preferredSlots: raw.preferredSlots, budgetAud, customerNotes: customerNotes.trim()};
         }
@@ -76,6 +108,12 @@ export function createTradeActionPolicy(inventory, remote) {
           const latest = [...checks].reverse().find(check => slot.date >= check.from && slot.date <= check.to);
           return !latest || latest.unavailable.has(`${slot.date}:${slot.timeRange}`);
         })) return {status: 'AVAILABILITY_REQUIRED', message: 'Successfully check availability for every preferred date and choose sessions that are not unavailable.'};
+        if (prepareOnly) {
+          prepared = structuredClone(args);
+          const {customerConfirmed: _confirmation, ...summary} = args;
+          return {status: 'READY_FOR_CONFIRMATION', summary,
+            message: 'The supplied details passed bridge validation and availability prerequisites. They are held in this call, not saved as a booking or reserved. Read back this summary once, obtain permission, then submit using only customerConfirmed=true. Do not ask for names or contacts again unless the caller corrects them. Backend live validation will run at submission.'};
+        }
         writes.set(name, {fingerprint, requestKey: randomUUID(), result: unknown()});
       }
       try {
@@ -114,4 +152,5 @@ export function createTradeActionPolicy(inventory, remote) {
       }
     },
   };
+  return policy;
 }

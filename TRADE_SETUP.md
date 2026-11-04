@@ -1,5 +1,47 @@
 # Direct Trade dashboard routing
 
+## Prepare, then submit
+
+The Trade MCP server still exposes six tools when writes are enabled. The bridge
+adds the local `prepare_inspection_request` function to validate and hold collected
+details before the final readback. Its voice-facing `create_inspection_request`
+takes only `customerConfirmed=true`; the bridge supplies the prepared details and
+private key to the original backend tool. No booking is saved or reserved during
+preparation. Live backend validation still runs at submission. Corrections require
+a new preparation; a failed preparation clears the previous draft. Saved or
+uncertain writes cannot be duplicated by preparing a different request.
+
+Upload `bridge.mjs`, `trade-tools.mjs` and `trade-action-policy.mjs` together and
+restart the existing bridge. The next call logs `Conversation flow v11`. This
+update adds no env settings or backend endpoints. Seven voice functions appear
+with writes enabled, including the local preparation function; the backend MCP
+inventory remains six. Contacts should be clarified as collected, not re-entered
+after submission consent. Real validation errors may still require a targeted
+correction before submission.
+
+## Both portal request options
+
+For a listed service, use `requestType=existing_service`, its verified `serviceId`
+and `customRequest=null`. For "Not sure / need advice", use
+`requestType=custom_quote`, `serviceId=null` and a `customRequest` with a short
+scope/title (3-120 characters) and optional description (up to 1500 characters).
+Do not force a service selection for advice. Both paths retain the same contacts,
+site, one to three preferred dates/sessions, live availability and consent checks.
+Advice requests can also schedule a visit when Trade's staff-automation flag and
+the business's Sophie booking authority are enabled. In Team, the chosen inspector
+must be active and permitted to receive and handle quotation requests
+(`canget_qutaion=true`). This is the eligibility rule for an assessment without a
+service; no skill or service ID is inferred from free text. Working hours, off days,
+leave, existing work, closures and travel buffers still apply. If no permitted
+inspector is free, the request stays pending. CONFIRMED schedules the assessment
+visit only; it does not approve a quotation or work price. Both new portal and voice
+requests use the shared Trade assignment workflow.
+
+Deploy Trade's updated MCP schema first, then upload `bridge.mjs`,
+`trade-tools.mjs` and `trade-action-policy.mjs` together and restart the bridge.
+There are no new env settings. The six backend MCP tools remain unchanged in
+name; preparation is an additional local bridge function.
+
 ## Text call transcripts
 
 Upload `bridge.mjs` and `call-transcript.mjs` together, then restart the existing
@@ -90,7 +132,7 @@ redeploy Trade. No new bridge env setting is required. Verify in SSH:
 node --env-file=.env --env-file=.env.trade-direct-pilot check-mcp.mjs 0359111403
 ```
 
-Expected: Nira Electrical Lynbrook's business verifies, services load, and six
+Expected: Nira Electrical Lynbrook's business verifies, services load, and seven
 tools are listed (four if actions are disabled). This check never creates a
 customer or inspection. Stop and restart the existing bridge process with
 both environment files after verification. No Asterisk dialplan changes are needed.

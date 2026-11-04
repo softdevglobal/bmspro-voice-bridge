@@ -69,7 +69,7 @@ test('real MCP session calls customer and booking tools with hidden retry keys a
   const f = await fixture({actions: true}); let session;
   try {
     session = await openTradeSession(f.config);
-    assert.equal(session.tools.length, 6);
+    assert.equal(session.tools.length, 7);
     for (const tool of session.tools.filter(tool => ['register_customer', 'create_inspection_request'].includes(tool.name))) {
       assert.equal(tool.parameters.properties.requestKey, undefined);
       assert.equal(tool.parameters.required.includes('requestKey'), false);
@@ -82,8 +82,12 @@ test('real MCP session calls customer and booking tools with hidden retry keys a
     await session.call('get_available_slots', {from: '2099-11-05', to: '2099-11-05'});
     const args = {customerConfirmed: true, customer, customerId: account.customerId, serviceId: 'service-a',
       address: {street: '1 Test Street', suburb: 'Lynbrook', state: 'VIC', postcode: '3975'}, preferredSlots: [{date: '2099-11-05', timeRange: 'morning'}]};
-    assert.equal((await session.call('create_inspection_request', args)).status, 'PENDING_REVIEW');
-    assert.equal((await session.call('create_inspection_request', args)).status, 'PENDING_REVIEW');
+    const {customerConfirmed: _confirmation, ...details} = args;
+    assert.equal((await session.call('prepare_inspection_request', details)).status, 'READY_FOR_CONFIRMATION');
+    const submitTool = session.tools.find(tool => tool.name === 'create_inspection_request');
+    assert.deepEqual(Object.keys(submitTool.parameters.properties), ['customerConfirmed']);
+    assert.equal((await session.call('create_inspection_request', {customerConfirmed: true})).status, 'PENDING_REVIEW');
+    assert.equal((await session.call('create_inspection_request', {customerConfirmed: true})).status, 'PENDING_REVIEW');
     const submissions = f.calls.filter(call => call.name === 'create_inspection_request');
     assert.equal(submissions.length, 1); assert.ok(submissions[0].args.requestKey);
     assert.ok(f.bindings.every(binding => binding === 'business-a'));

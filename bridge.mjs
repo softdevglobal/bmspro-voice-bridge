@@ -348,7 +348,7 @@ wss.on('connection', media => {
         : businessConfig.mode === 'pink'
           ? `Speak this greeting in English, preserving the complete sentence "My name is Sophie": "Hello, thank you for calling ${JSON.stringify(businessConfig.businessName)}, ${JSON.stringify(businessConfig.branch)}. My name is Sophie, your AI receptionist. How can I help?" Pronounce Sophie as SOH-fee. Then pause and listen. Do not call a tool before greeting.`
         : businessConfig.mode === 'trade'
-          ? `Speak this greeting in English, preserving the complete sentence "My name is Sophie": "Hi, thanks for calling ${JSON.stringify(businessConfig.businessName)}. My name is Sophie, your AI receptionist. How can I help?" Pronounce Sophie as SOH-fee. Then pause and listen. Do not call a tool before greeting.`
+          ? `Speak this greeting in English, preserving the complete sentence "My name is Sophie": "Hi, thanks for calling ${JSON.stringify(businessConfig.businessName)}. My name is Sophie, your AI receptionist. Would you like an existing service, or do you need advice?" Pronounce Sophie as SOH-fee. Then pause and listen. Do not call a tool before greeting.`
           : `Speak this greeting in English, preserving the complete sentence "My name is Sophie": "Hello, thank you for calling ${JSON.stringify(businessConfig.workshop)}, ${JSON.stringify(businessConfig.branch)}. My name is Sophie, your AI receptionist. How can I help?" Pronounce Sophie as SOH-fee. Then pause and listen. Do not call a tool before greeting.`;
       live = new LiveWS(client, {reconnect: null, maxQueueSize: 64000});
       live.on('error', error => {
@@ -359,19 +359,25 @@ wss.on('connection', media => {
       });
       live.socket.on('open', () => {
         if (closing) return live.socket.platformSocket.terminate();
+        const timeZone = businessSession.profile?.timezone || businessConfig.timezone || 'Australia/Melbourne';
+        const localNow = new Intl.DateTimeFormat('en-AU', {timeZone, dateStyle: 'full', timeStyle: 'short'}).format(new Date());
+        const dateInstructions = `At session start the current local date and time is ${localNow}, timezone ${timeZone}. Use this to resolve today, tomorrow and dates without a year. Clarify ambiguous dates immediately, before any other form field; never invent a weekday or postpone the year question until submission. Use ISO dates including the resolved year in tools.`;
+        log('Conversation flow v11: portal questions only; service and advice inspections can schedule when Trade confirms staff.');
         live.send({type: 'session.start', session: {
           model: 'gpt-live-1', store: false,
           instructions: [
             businessSession.voiceInstructions ?? voiceInstructions(businessConfig),
             'Your name is Sophie. Identify yourself as Sophie, the AI assistant, in the opening greeting. For onboarding, you are Sophie from BMS Pro helping with business setup; do not ask the caller to choose an AI receptionist name.',
             'Keep routine replies to one or two short sentences and ask one question at a time. If backend work takes time, briefly acknowledge the request while waiting; do not announce an unverified result.',
+            businessSession.turnInstructions || '',
+            dateInstructions,
           ].join(' '),
           input: [{role: 'developer', content: [{type: 'input_text', text: openingGreeting}]}],
           // Pin one voice for the whole call; changing voices between routes sounds like speaker switching.
           audio: {format: {type: 'audio/pcmu', rate: 8000}, output: {voice: 'shimmer'}},
           delegation: {type: 'responses', responses: {
             model: 'gpt-6-luna', tools: businessSession.tools, parallel_tool_calls: false,
-            instructions: businessSession.backendInstructions ?? backendInstructions(businessConfig)
+            instructions: [businessSession.backendInstructions ?? backendInstructions(businessConfig), businessSession.turnInstructions || '', dateInstructions].join(' ')
           }}
         }});
       });
