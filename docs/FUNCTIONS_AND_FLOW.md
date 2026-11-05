@@ -158,6 +158,7 @@ Both files are passed with two `--env-file` flags. Never commit or upload secret
 4. [Function reference (every file)](#4-function-reference-every-file)
 5. [What is written to disk](#5-what-is-written-to-disk)
 6. [Where planned features will go](#6-where-planned-features-will-go)
+7. Where the AI agent lives (bridge vs Trade): see [AI_AGENT_BRIDGE_VS_TRADE.md](AI_AGENT_BRIDGE_VS_TRADE.md)
 
 ---
 
@@ -298,6 +299,7 @@ bmspro-voice-bridge/
 │     └─ websocket_client.conf.example  Where Asterisk connects (ws://127.0.0.1:8787/media)
 └─ docs/
    ├─ FUNCTIONS_AND_FLOW.md           This page
+   ├─ AI_AGENT_BRIDGE_VS_TRADE.md     Where the AI agent lives: bridge vs Trade, per-business agents
    ├─ MULTI_WORKSHOP_SETUP.md         Black multi-workshop setup (older single-file paths)
    ├─ ONBOARDING_SETUP.md             Onboarding setup (older single-file paths)
    ├─ PINK_SETUP.md                   Pink setup (older single-file paths)
