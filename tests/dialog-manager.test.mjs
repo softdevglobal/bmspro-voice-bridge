@@ -46,6 +46,37 @@ test('Trade flow: optional steps pass once later steps finish; submit needs a pr
   assert.deepEqual(dialog.snapshot().completed, ['service', 'address', 'availability', 'contact', 'readback', 'submitted']);
 });
 
+test('Trade job booking walks the inspection steps with the job tools', () => {
+  const dialog = createDialogManager({mode: 'trade'});
+  assert.deepEqual(dialog.check('prepare_job_booking').missingSteps, ['availability']);
+  assert.deepEqual(dialog.check('create_job_booking').missingSteps, ['readback']);
+  dialog.record('list_services', [{id: 's1', name: 'Switchboard'}]);
+  dialog.record('get_available_slots', {brand: 'trade', from: '2099-11-05', to: '2099-11-05', unavailable: []});
+  dialog.record('prepare_job_booking', {status: 'READY_FOR_CONFIRMATION', summary: {}});
+  assert.equal(dialog.snapshot().step, 'submitted');
+  assert.equal(dialog.check('create_job_booking'), null);
+  dialog.record('create_job_booking', {status: 'PENDING_REVIEW', requestId: 'r1'});
+  assert.equal(dialog.snapshot().step, 'done');
+});
+
+test('Trade job cancel needs only a verified lookup; reschedule needs availability first', () => {
+  const cancel = createDialogManager({mode: 'trade'});
+  cancel.record('find_job', {status: 'NOT_FOUND'});
+  assert.equal(cancel.snapshot().step, 'service');
+  cancel.record('find_job', {status: 'MATCHED', jobCode: 'BK 4K7H2M9PQ', job: {canChange: true}});
+  assert.equal(cancel.check('cancel_job'), null);
+  cancel.record('cancel_job', {status: 'CANCELLED', jobCode: 'BK 4K7H2M9PQ'});
+  assert.equal(cancel.snapshot().step, 'done');
+
+  const move = createDialogManager({mode: 'trade'});
+  move.record('find_job', {status: 'MATCHED', jobCode: 'BK 4K7H2M9PQ', job: {canChange: true}});
+  assert.deepEqual(move.check('reschedule_job').missingSteps, ['availability']);
+  move.record('get_available_slots', {brand: 'trade', from: '2099-11-05', to: '2099-11-05', unavailable: []});
+  assert.equal(move.check('reschedule_job'), null);
+  move.record('reschedule_job', {status: 'CONFIRMED', jobCode: 'BK 4K7H2M9PQ'});
+  assert.equal(move.snapshot().step, 'done');
+});
+
 test('Pink list_services returns an array; annotate leaves arrays unchanged', () => {
   const dialog = createDialogManager({mode: 'pink'});
   const services = [{id: 's1', name: 'Cut'}];

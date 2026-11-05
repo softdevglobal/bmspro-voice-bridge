@@ -536,13 +536,16 @@ flowchart LR
     end
 ```
 
-`*` optional: counts as passed once a later step is done. Gates (write tools blocked until these steps are done):
+`*` optional: counts as passed once a later step is done. Trade jobs use the same steps: `prepare_job_booking` / `create_job_booking` stand in for the inspection tools, and a matched `find_job` completes service, address and contact. `cancel_job` needs no new date, so it also completes availability. The Trade session still requires a same-call `find_job` match before `reschedule_job` or `cancel_job`. Gates (write tools blocked until these steps are done):
 
 | Mode | Write tool | Needs |
 |---|---|---|
 | Black | `create_booking` | availability |
 | Trade | `prepare_inspection_request` | availability |
 | Trade | `create_inspection_request` | readback |
+| Trade | `prepare_job_booking` | availability |
+| Trade | `create_job_booking` | readback |
+| Trade | `reschedule_job` | availability |
 | Pink | `create_booking` | service, availability |
 | Onboarding | `complete_business_onboarding` | details |
 

@@ -1,7 +1,8 @@
 import {randomUUID} from 'node:crypto';
 
 const baseTools = ['get_business_profile', 'list_services'];
-const writeTools = ['register_customer', 'create_inspection_request'];
+export const writeTools = Object.freeze(['register_customer', 'create_inspection_request', 'create_job_booking', 'reschedule_job', 'cancel_job']);
+const jobWrites = ['reschedule_job', 'cancel_job'];
 const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
@@ -19,26 +20,56 @@ function contact(value, full = false) {
   return {fullName: value.fullName.trim(), email, phone};
 }
 const contactKey = value => canonical({email: value.email, phone: value.phone});
+const clock = value => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+/** Same normalisation as Trade: spoken references may drop the BK prefix or add spaces. */
+function jobCode(value) {
+  if (typeof value !== 'string' || value.length > 40) return null;
+  let compact = value.toUpperCase().replace(/[^0-9A-Z]/g, '');
+  if (compact.length === 11 && compact.startsWith('BK')) compact = compact.slice(2);
+  return /^[2-9A-HJKMNP-Z]{9}$/.test(compact) ? `BK ${compact}` : null;
+}
+/** One to three distinct sessions; jobs may add an exact HH:MM start time. */
+function sessions(value, allowStart) {
+  const keys = allowStart ? ['date', 'timeRange', 'startTime'] : ['date', 'timeRange'];
+  if (!Array.isArray(value) || !value.length || value.length > 3 || value.some(slot => !only(slot, keys) || !date(slot.date) ||
+      !['morning', 'afternoon'].includes(slot.timeRange) || (slot.startTime != null && !clock(slot.startTime)))) return null;
+  if (new Set(value.map(slot => `${slot.date}:${slot.timeRange}`)).size !== value.length) return null;
+  return value.map(slot => allowStart ? {date: slot.date, timeRange: slot.timeRange, startTime: slot.startTime ?? null} : {date: slot.date, timeRange: slot.timeRange});
+}
+function address(value) {
+  if (!only(value, ['street', 'suburb', 'state', 'postcode']) || typeof value.street !== 'string' || value.street.length > 300 ||
+      typeof value.suburb !== 'string' || !value.suburb.trim() || value.suburb.length > 200 || typeof value.state !== 'string' || !value.state.trim() || value.state.length > 100 || !/^\d{4}$/.test(value.postcode)) return null;
+  return {street: value.street.trim(), suburb: value.suburb.trim(), state: value.state.trim(), postcode: value.postcode};
+}
 
 /** Per-call prerequisites, references and retry identity. Models never supply request keys. */
 export function createTradeActionPolicy(inventory, remote) {
-  const services = new Set(), customers = new Map(), checks = [], writes = new Map();
-  let prepared = null;
+  const services = new Set(), customers = new Map(), checks = [], writes = new Map(), jobs = new Map();
+  // Prepared details per submission tool (inspection or job), held only in this call.
+  const prepared = new Map();
   const names = [...baseTools, ...['find_customer', 'get_available_slots'].filter(name => inventory.has(name))];
   if (inventory.has('find_customer') && inventory.has('register_customer')) names.push('register_customer');
   if (inventory.has('find_customer') && inventory.has('get_available_slots') && inventory.has('create_inspection_request')) names.push('create_inspection_request');
+  if (inventory.has('find_job')) names.push('find_job');
+  if (inventory.has('find_customer') && inventory.has('get_available_slots') && inventory.has('create_job_booking')) names.push('create_job_booking');
+  // Changing a job needs this call's verified lookup and a live availability check first.
+  for (const name of jobWrites) if (inventory.has('find_job') && inventory.has('get_available_slots') && inventory.has(name)) names.push(name);
+  const unchecked = slots => slots.some(slot => {
+    const latest = [...checks].reverse().find(check => slot.date >= check.from && slot.date <= check.to);
+    return !latest || latest.unavailable.has(`${slot.date}:${slot.timeRange}`);
+  });
   const policy = {
     names,
-    async prepare(raw) {
-      prepared = null;
+    async prepare(raw, name = 'create_inspection_request') {
+      prepared.delete(name);
       if (!object(raw) || Object.hasOwn(raw, 'customerConfirmed')) return rejected('Prepare the collected details without a confirmation flag.');
-      return policy.call('create_inspection_request', {...raw, customerConfirmed: true}, {prepareOnly: true});
+      return policy.call(name, {...raw, customerConfirmed: true}, {prepareOnly: true});
     },
-    async submit(raw) {
+    async submit(raw, name = 'create_inspection_request') {
       if (!only(raw, ['customerConfirmed'])) return rejected('Submit only the confirmation flag; reuse the prepared details without asking the caller again.');
       if (raw.customerConfirmed !== true) return {status: 'CONFIRMATION_REQUIRED', message: 'Submit only after the caller explicitly agrees to send the prepared request.'};
-      if (!prepared) return {status: 'PREPARATION_REQUIRED', message: 'Prepare the details already collected in this call first. Do not restart name, phone or email questions unless preparation identifies an actual missing or invalid field.'};
-      return policy.call('create_inspection_request', structuredClone(prepared));
+      if (!prepared.has(name)) return {status: 'PREPARATION_REQUIRED', message: 'Prepare the details already collected in this call first. Do not restart name, phone or email questions unless preparation identifies an actual missing or invalid field.'};
+      return policy.call(name, structuredClone(prepared.get(name)));
     },
     async call(name, raw, {prepareOnly = false} = {}) {
       if (!names.includes(name)) return rejected('Tool unavailable. No action was performed.');
@@ -51,6 +82,28 @@ export function createTradeActionPolicy(inventory, remote) {
       } else if (name === 'find_customer') {
         args = contact(raw);
         if (!args) return rejected('Ask for a valid email and phone number.');
+      } else if (name === 'find_job') {
+        const code = jobCode(raw.jobCode), found = only(raw, ['jobCode', 'email', 'phone']) ? contact({email: raw.email, phone: raw.phone}) : null;
+        if (!code || !found) return rejected('Ask for the job reference from the booking message plus the email and mobile on the job.');
+        args = {jobCode: code, ...found};
+      } else if (jobWrites.includes(name)) {
+        if (raw.customerConfirmed !== true) return {status: 'CONFIRMATION_REQUIRED', message: 'Read back the job change and obtain explicit confirmation first.'};
+        const code = jobCode(raw.jobCode), verified = code && jobs.get(code);
+        if (!verified) return {status: 'LOOKUP_REQUIRED', message: 'Find this job with find_job in this call first, using the reference and the contacts on the job.'};
+        if (!verified.canChange) return rejected('This job must be changed by the team. Do not attempt it.');
+        const extra = name === 'reschedule_job' ? 'preferredSlots' : 'reason';
+        if (!only(raw, ['customerConfirmed', 'jobCode', extra])) return rejected('Use only the advertised job change fields.');
+        args = {customerConfirmed: true, jobCode: code, ...verified.contact};
+        if (name === 'reschedule_job') {
+          const slots = sessions(raw.preferredSlots, true);
+          if (!slots) return rejected('Choose one to three distinct new dates with morning/afternoon and an optional exact HH:MM start time.');
+          if (unchecked(slots)) return {status: 'AVAILABILITY_REQUIRED', message: 'Check availability for every new date and choose sessions that are not unavailable.'};
+          args.preferredSlots = slots;
+        } else {
+          const reason = raw.reason ?? '';
+          if (typeof reason !== 'string' || reason.length > 500) return rejected('Keep the cancellation reason under 500 characters.');
+          args.reason = reason.trim();
+        }
       } else if (name === 'get_available_slots') {
         if (!only(raw, ['from', 'to']) || !date(raw.from) || !date(raw.to) || raw.to < raw.from || (Date.parse(raw.to) - Date.parse(raw.from)) / 86400000 >= 90)
           return rejected('Choose valid from/to dates spanning 1-90 days.');
@@ -70,6 +123,18 @@ export function createTradeActionPolicy(inventory, remote) {
         if (name === 'register_customer') {
           if (!only(raw, ['customerConfirmed', 'customer'])) return rejected('Use only the advertised customer registration fields.');
           args = {customerConfirmed: true, customer};
+        } else if (name === 'create_job_booking') {
+          if (!only(raw, ['customerConfirmed', 'serviceId', 'customerId', 'customer', 'address', 'preferredSlots', 'customerNotes']))
+            return rejected('Use only the advertised job booking fields.');
+          if (!services.has(raw.serviceId)) return rejected('List services in this call and choose a returned service. Jobs book existing services only; offer an inspection for advice.');
+          const site = address(raw.address), slots = sessions(raw.preferredSlots, true);
+          if (!site) return rejected('Collect and read back the job address, suburb, state and four-digit postcode.');
+          if (!slots) return rejected('Choose one to three distinct dates with morning/afternoon and an optional exact HH:MM start time.');
+          const customerId = raw.customerId ?? null, customerNotes = raw.customerNotes ?? '';
+          if (customerId !== null && (!id(customerId) || customers.get(customerId) !== contactKey(customer))) return rejected('Use a customer reference returned for these same contact details in this call, or null for a guest.');
+          if (typeof customerNotes !== 'string' || customerNotes.length > 2000) return rejected('Keep job notes under 2000 characters.');
+          if (unchecked(slots)) return {status: 'AVAILABILITY_REQUIRED', message: 'Successfully check availability for every preferred date and choose sessions that are not unavailable.'};
+          args = {customerConfirmed: true, serviceId: raw.serviceId, customerId, customer, address: site, preferredSlots: slots, customerNotes: customerNotes.trim()};
         } else {
           if (!only(raw, ['customerConfirmed', 'requestType', 'serviceId', 'customRequest', 'customerId', 'customer', 'address', 'preferredSlots', 'budgetAud', 'customerNotes']))
             return rejected('Use only the advertised inspection fields.');
@@ -102,6 +167,8 @@ export function createTradeActionPolicy(inventory, remote) {
             address: {street: address.street.trim(), suburb: address.suburb.trim(), state: address.state.trim(), postcode: address.postcode},
             preferredSlots: raw.preferredSlots, budgetAud, customerNotes: customerNotes.trim()};
         }
+      }
+      if (writeTools.includes(name)) {
         const existing = writes.get(name), fingerprint = canonical(args);
         if (existing) return existing.fingerprint === fingerprint ? existing.result : rejected('This call already has a saved or uncertain action. Staff must verify it; do not submit another.');
         if (name === 'create_inspection_request' && args.preferredSlots.some(slot => {
@@ -109,7 +176,7 @@ export function createTradeActionPolicy(inventory, remote) {
           return !latest || latest.unavailable.has(`${slot.date}:${slot.timeRange}`);
         })) return {status: 'AVAILABILITY_REQUIRED', message: 'Successfully check availability for every preferred date and choose sessions that are not unavailable.'};
         if (prepareOnly) {
-          prepared = structuredClone(args);
+          prepared.set(name, structuredClone(args));
           const {customerConfirmed: _confirmation, ...summary} = args;
           return {status: 'READY_FOR_CONFIRMATION', summary,
             message: 'The supplied details passed bridge validation and availability prerequisites. They are held in this call, not saved as a booking or reserved. Read back this summary once, obtain permission, then submit using only customerConfirmed=true. Do not ask for names or contacts again unless the caller corrects them. Backend live validation will run at submission.'};
@@ -121,11 +188,15 @@ export function createTradeActionPolicy(inventory, remote) {
         const result = await remote(name, writeTools.includes(name) ? {...args, requestKey: state.requestKey} : args);
         if (writeTools.includes(name)) {
           const success = name === 'register_customer' ? ['CREATED', 'EXISTS'].includes(result?.status) && id(result.customerId)
-            : ['PENDING_REVIEW', 'CONFIRMED'].includes(result?.status) && id(result.requestId);
+            : name === 'create_inspection_request' ? ['PENDING_REVIEW', 'CONFIRMED'].includes(result?.status) && id(result.requestId)
+            : name === 'cancel_job' ? result?.status === 'CANCELLED' && !!jobCode(result.jobCode)
+            : name === 'create_job_booking' && result?.status === 'PENDING_REVIEW' ? id(result.requestId)
+            : result?.status === 'CONFIRMED' && !!jobCode(result.jobCode) && date(result.appointment?.date) && clock(result.appointment?.startTime);
           if (success) {
             state.result = result;
             if (name === 'register_customer') customers.set(result.customerId, contactKey(args.customer));
-          } else if (result?.status === 'REJECTED' && typeof result.message === 'string') {
+            if (jobWrites.includes(name)) jobs.delete(args.jobCode);
+          } else if (['REJECTED', 'NOT_FOUND'].includes(result?.status) && typeof result.message === 'string') {
             if (result.code === 'REQUEST_KEY_CONFLICT') state.result = result;
             else writes.delete(name);
             return result;
@@ -135,6 +206,11 @@ export function createTradeActionPolicy(inventory, remote) {
         if (name === 'list_services') {
           if (!Array.isArray(result) || result.some(service => !id(service?.id) || typeof service.name !== 'string')) throw new Error('Invalid services.');
           services.clear(); for (const service of result) services.add(service.id);
+        }
+        if (name === 'find_job') {
+          if (result?.status === 'MATCHED' && jobCode(result.jobCode) === args.jobCode && typeof result.job?.canChange === 'boolean')
+            jobs.set(args.jobCode, {contact: {email: args.email, phone: args.phone}, canChange: result.job.canChange});
+          else if (!['NOT_FOUND', 'REJECTED'].includes(result?.status)) throw new Error('Invalid job lookup.');
         }
         if (name === 'find_customer') {
           if (result?.status === 'MATCHED' && id(result.customerId)) customers.set(result.customerId, contactKey(args));
