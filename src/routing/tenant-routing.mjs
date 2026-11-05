@@ -1,4 +1,4 @@
-import {loadBusinessConfig} from './business-tools.mjs';
+import {loadBusinessConfig} from '../agents/black/business-tools.mjs';
 
 export function loadTenantRoutes(env = process.env) {
   if (!env.BMSPRO_BRIDGE_SECRET?.trim()) throw new Error('Set BMSPRO_BRIDGE_SECRET to the shared backend bridge credential.');

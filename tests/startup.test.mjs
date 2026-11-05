@@ -4,8 +4,8 @@ import http from 'node:http';
 import {Server} from '@modelcontextprotocol/sdk/server/index.js';
 import {StreamableHTTPServerTransport} from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {ListToolsRequestSchema, CallToolRequestSchema, ReadResourceRequestSchema} from '@modelcontextprotocol/sdk/types.js';
-import {openBusinessSession, VOICE_TOOLS} from './business-tools.mjs';
-import {openOnboardingSession, ONBOARDING_TOOLS} from './onboarding-tools.mjs';
+import {openBusinessSession, VOICE_TOOLS} from '../src/agents/black/business-tools.mjs';
+import {openOnboardingSession, ONBOARDING_TOOLS} from '../src/agents/onboarding/onboarding-tools.mjs';
 
 async function fixture(mode, mismatch = false, expectedReads = 3) {
   const startupReads = new Set(), calls = [];

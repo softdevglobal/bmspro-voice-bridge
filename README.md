@@ -1,5 +1,76 @@
 # BMSPro voice bridge
 
+## Project layout
+
+```
+bmspro-voice-bridge/
+├─ bridge.mjs                      Entry point (starts src/server/bridge.mjs)
+├─ src/
+│  ├─ server/bridge.mjs            HTTP /health, Asterisk WebSocket, per-call orchestration
+│  ├─ routing/tenant-routing.mjs   Dialled number (DID) -> business and mode
+│  ├─ agents/
+│  │  ├─ registry.mjs              Mode -> agent session + opening greeting
+│  │  ├─ black/business-tools.mjs  Black workshop receptionist
+│  │  ├─ trade/trade-tools.mjs     Trade inspections and advice
+│  │  ├─ trade/trade-action-policy.mjs  Trade per-call safety rules
+│  │  ├─ pink/pink-tools.mjs       Pink salon receptionist
+│  │  └─ onboarding/onboarding-tools.mjs  New business sign-up
+│  ├─ dialog/
+│  │  ├─ dialog-manager.mjs        Per-call conversation steps, write gates, retry limit
+│  │  └─ flows.mjs                 Step definitions for each mode
+│  ├─ audio/input-audio.mjs        20 ms paced audio timers
+│  ├─ audio/draft-typing.mjs       Typing sound and speech detection (PCMU)
+│  ├─ asr/voice-studio-shadow.mjs  Optional comparison speech-to-text
+│  └─ observability/call-transcript.mjs  Per-call transcript files
+├─ tests/                          node --test suites
+├─ scripts/                        check-mcp.mjs, diagnose-trade.mjs
+├─ deploy/asterisk/                extensions.conf / websocket_client.conf examples
+└─ docs/                           Setup guides and FUNCTIONS_AND_FLOW.md (diagrams)
+```
+
+Commands:
+
+```
+npm start                                   # node --env-file=.env bridge.mjs
+npm test                                    # all offline tests
+node --env-file=.env scripts/check-mcp.mjs <DID>
+```
+
+### Deploying after the folder change
+
+Older setup guides in `docs/` copy single files (for example `scp bridge.mjs trade-tools.mjs ...`).
+Those files now live under `src/`. Copy the whole tree instead, keeping the layout:
+
+```
+scp -r bridge.mjs package.json package-lock.json src dev@<server>:/home/<user>/bmspro-voice-bridge/
+```
+
+Then run `npm ci` if dependencies changed and restart the bridge as before
+(`node --env-file=.env bridge.mjs` still works). In old commands, `check-mcp.mjs` is now
+`scripts/check-mcp.mjs` and the Asterisk examples are in `deploy/asterisk/`.
+
+### Dialog manager
+
+`src/dialog/dialog-manager.mjs` keeps per-call conversation state for every mode
+(Black, Trade, Pink, onboarding). On each tool call it:
+
+1. blocks a write tool whose earlier steps are not done yet (`STEP_REQUIRED`, no action performed),
+2. stops a write tool after 3 failed attempts in a row (`RETRY_LIMIT`),
+3. records progress and adds `dialogState` (current step, completed steps, next hint) to the tool result the AI reads.
+
+The steps for each mode are in `src/dialog/flows.mjs`. The gates repeat rules
+the agent sessions and backend already enforce, so they only fire earlier and
+give a clearer next step. Logs show `Dialog: step a -> b`, blocked tools, and a
+`Dialog final:` line when the call ends.
+
+Set `BMSPRO_DIALOG_MANAGER` in `.env`:
+
+| Value | Behaviour |
+|---|---|
+| `on` (default) | Track, gate and add hints |
+| `observe` | Track and log only (`would block ...`); tool results unchanged |
+| `off` | Disabled; the bridge behaves exactly as before the dialog manager |
+
 ## Optional VoiceStudio shadow ASR test
 
 The bridge can mirror caller PCMU audio to VoiceStudio's local streaming ASR

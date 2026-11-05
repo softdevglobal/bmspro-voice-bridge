@@ -4,8 +4,8 @@ import http from 'node:http';
 import {Server} from '@modelcontextprotocol/sdk/server/index.js';
 import {StreamableHTTPServerTransport} from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {ListToolsRequestSchema, CallToolRequestSchema, ReadResourceRequestSchema} from '@modelcontextprotocol/sdk/types.js';
-import {loadTenantRoutes, configForDid, resolveMediaStartRoute} from './tenant-routing.mjs';
-import {openOnboardingSession, ONBOARDING_TOOLS} from './onboarding-tools.mjs';
+import {loadTenantRoutes, configForDid, resolveMediaStartRoute} from '../src/routing/tenant-routing.mjs';
+import {openOnboardingSession, ONBOARDING_TOOLS} from '../src/agents/onboarding/onboarding-tools.mjs';
 
 const env = {BMSPRO_BRIDGE_SECRET: 'workshop-secret-test-00000000000000000000',
   BMSPRO_ONBOARDING_BRIDGE_SECRET: 'onboarding-secret-test-000000000000000000', BMSPRO_ONBOARDING_DIDS_JSON: '["0359111499"]'};
