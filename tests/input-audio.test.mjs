@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createInputAudioClock, createPacedAudioTimer} from './input-audio.mjs';
+import {createInputAudioClock, createPacedAudioTimer} from '../src/audio/input-audio.mjs';
 
 function fixture(options = {}) {
   const frames = [];

@@ -3,7 +3,7 @@ import test from 'node:test';
 import {mkdtemp, readFile, rm, stat, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {createCallTranscript} from './call-transcript.mjs';
+import {createCallTranscript} from '../src/observability/call-transcript.mjs';
 
 const id = '11111111-1111-4111-8111-111111111111';
 test('call text is updated live, preserves fragments, separates speakers and excludes tool payloads', async () => {

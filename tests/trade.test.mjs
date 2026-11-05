@@ -4,8 +4,8 @@ import http from 'node:http';
 import {Server} from '@modelcontextprotocol/sdk/server/index.js';
 import {StreamableHTTPServerTransport} from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {ListToolsRequestSchema, CallToolRequestSchema} from '@modelcontextprotocol/sdk/types.js';
-import {loadTenantRoutes, resolveConfigForDid} from './tenant-routing.mjs';
-import {openTradeSession, TRADE_READ_TOOLS} from './trade-tools.mjs';
+import {loadTenantRoutes, resolveConfigForDid} from '../src/routing/tenant-routing.mjs';
+import {openTradeSession, TRADE_READ_TOOLS} from '../src/agents/trade/trade-tools.mjs';
 
 const secret = 'test-bridge-secret-for-trade-0000000000000';
 test('legacy routing remains available when direct Trade is not configured', async () => {

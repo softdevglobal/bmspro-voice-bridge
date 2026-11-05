@@ -4,7 +4,7 @@ import http from 'node:http';
 import {Server} from '@modelcontextprotocol/sdk/server/index.js';
 import {StreamableHTTPServerTransport} from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {ListToolsRequestSchema, CallToolRequestSchema} from '@modelcontextprotocol/sdk/types.js';
-import {openPinkSession, PINK_READ_TOOLS} from './pink-tools.mjs';
+import {openPinkSession, PINK_READ_TOOLS} from '../src/agents/pink/pink-tools.mjs';
 
 async function fixture({writeEnabled = true, uncertain = false, wrongBrand = false} = {}) {
   const calls = [], names = [...PINK_READ_TOOLS, ...(writeEnabled ? ['create_booking'] : [])];

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {loadTenantRoutes, resolveConfigForDid} from './tenant-routing.mjs';
+import {loadTenantRoutes, resolveConfigForDid} from '../src/routing/tenant-routing.mjs';
 
 const env = {
   BMSPRO_BRIDGE_SECRET: 'command-center-test-secret-000000000000',
