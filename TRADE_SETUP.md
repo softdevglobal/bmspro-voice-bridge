@@ -115,6 +115,18 @@ Trade's dashboard is the sole source of DID-to-business assignments. Phone
 numbers still need their Yeastar/Asterisk route and Alert-Info DID marker.
 New Trade mappings need no bridge environment edits or restarts.
 
+## Jobs
+
+When Trade advertises job tools (Trade `AI_VOICE_ACTIONS_ENABLED=true`), the
+bridge follows the inspection flow: `prepare_job_booking` validates a listed
+service, address, contacts and checked availability for each date (with an
+optional exact `startTime` HH:MM), then `create_job_booking` sends only the
+confirmation flag with a private retry key. `CONFIRMED` returns the booked time;
+`PENDING_REVIEW` means the team will schedule it. `reschedule_job` and
+`cancel_job` appear only when the owner allows Sophie to change jobs, and need a
+`find_job` match in the same call with `canChange=true`; the bridge sends the
+verified email and mobile itself. Tests: `node --test trade-jobs.test.mjs`.
+
 ## Existing local pilot
 
 Keep the existing reverse SSH tunnel and Trade's development server running.

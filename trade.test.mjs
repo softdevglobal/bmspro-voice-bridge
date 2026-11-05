@@ -16,10 +16,14 @@ test('legacy routing remains available when direct Trade is not configured', asy
   }
 });
 
-async function fixture({extraTools = false, invalidProfile = false, actions = false} = {}) {
+async function fixture({extraTools = false, invalidProfile = false, actions = false, jobs = false} = {}) {
   const calls = [], bindings = [];
   let businessId = 'business-a';
-  const names = [...TRADE_READ_TOOLS, ...(actions ? ['find_customer', 'get_available_slots', 'register_customer', 'create_inspection_request'] : extraTools ? ['get_available_slots', 'create_inspection_request'] : [])];
+  const names = [...TRADE_READ_TOOLS, ...(actions ? ['find_customer', 'get_available_slots', 'register_customer', 'create_inspection_request'] : extraTools ? ['get_available_slots', 'create_inspection_request'] : []),
+    ...(jobs ? ['find_job', 'create_job_booking', 'reschedule_job', 'cancel_job'] : [])];
+  const schema = name => ['reschedule_job', 'cancel_job'].includes(name)
+    ? {type: 'object', properties: {requestKey: {type: 'string'}, jobCode: {type: 'string'}, email: {type: 'string'}, phone: {type: 'string'}}, required: ['requestKey', 'jobCode', 'email', 'phone']}
+    : {type: 'object', properties: {requestKey: {type: 'string'}}, required: ['requestKey']};
   const server = http.createServer(async (req, res) => {
     assert.equal(req.headers.authorization, `Bearer ${secret}`);
     assert.equal(req.headers['x-bmspro-did'], '0359111403');
@@ -27,7 +31,7 @@ async function fixture({extraTools = false, invalidProfile = false, actions = fa
     if (binding) bindings.push(binding);
     if (binding && binding !== businessId) { res.writeHead(403, {'Content-Type': 'application/json'}); res.end('{}'); return; }
     const mcp = new Server({name: 'offline-trade', version: '1.0.0'}, {capabilities: {tools: {}}});
-    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({tools: names.map(name => ({name, inputSchema: {type: 'object', properties: {requestKey: {type: 'string'}}, required: ['requestKey']}}))}));
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({tools: names.map(name => ({name, inputSchema: schema(name)}))}));
     mcp.setRequestHandler(CallToolRequestSchema, async request => {
       const {name, arguments: args} = request.params;
       calls.push({name, args});
@@ -38,6 +42,9 @@ async function fixture({extraTools = false, invalidProfile = false, actions = fa
       else if (actions && name === 'get_available_slots') value = {brand: 'trade', ...args, unavailable: []};
       else if (actions && name === 'register_customer') value = {status: 'CREATED', customerId: 'customer-a'};
       else if (actions && name === 'create_inspection_request') value = {status: 'PENDING_REVIEW', requestId: 'request-a'};
+      else if (jobs && name === 'find_job') value = {status: 'MATCHED', jobCode: 'BK 4K7H2M9PQ', job: {canChange: true}};
+      else if (jobs && name === 'cancel_job') value = {status: 'CANCELLED', jobCode: 'BK 4K7H2M9PQ'};
+      else if (jobs && name === 'create_job_booking') value = {status: 'PENDING_REVIEW', requestId: 'request-job'};
       else throw new Error('Unsupported tools must never be called.');
       return {content: [{type: 'text', text: JSON.stringify(value)}]};
     });
@@ -111,4 +118,43 @@ test('Trade startup rejects a mismatched discovery business or Black profile', a
   try { await assert.rejects(openTradeSession({...f.config, businessId: 'business-b'})); } finally { await f.close(); }
   const invalid = await fixture({invalidProfile: true});
   try { await assert.rejects(openTradeSession(invalid.config)); } finally { await invalid.close(); }
+});
+
+test('job tools reach the model without retry keys or job-change contacts, and cancel uses the verified lookup', async () => {
+  const f = await fixture({actions: true, jobs: true}); let session;
+  try {
+    session = await openTradeSession(f.config);
+    const tools = new Map(session.tools.map(tool => [tool.name, tool]));
+    for (const name of ['find_job', 'create_job_booking', 'reschedule_job', 'cancel_job']) assert.ok(tools.has(name), name);
+    assert.deepEqual(Object.keys(tools.get('cancel_job').parameters.properties), ['jobCode']);
+    assert.deepEqual(tools.get('cancel_job').parameters.required, ['jobCode']);
+    assert.match(session.voiceInstructions, /find_job/);
+    const contact = {email: 'test@example.test', phone: '0412345678'};
+    assert.equal((await session.call('find_job', {jobCode: 'BK4K7H2M9PQ', ...contact})).status, 'MATCHED');
+    assert.equal((await session.call('cancel_job', {customerConfirmed: true, jobCode: 'BK 4K7H2M9PQ', reason: 'Moved house'})).status, 'CANCELLED');
+    const sent = f.calls.find(call => call.name === 'cancel_job').args;
+    assert.deepEqual({email: sent.email, phone: sent.phone, reason: sent.reason}, {...contact, reason: 'Moved house'});
+    assert.ok(sent.requestKey);
+  } finally { await session?.close(); await f.close(); }
+});
+
+test('job booking is prepared, read back and submitted with only the confirmation, and a pending result is kept', async () => {
+  const f = await fixture({actions: true, jobs: true}); let session;
+  try {
+    session = await openTradeSession(f.config);
+    const submit = session.tools.find(tool => tool.name === 'create_job_booking');
+    assert.deepEqual(Object.keys(submit.parameters.properties), ['customerConfirmed']);
+    assert.ok(session.tools.some(tool => tool.name === 'prepare_job_booking'));
+    const customer = {fullName: 'Test Customer', email: 'test@example.test', phone: '0412345678'};
+    const details = {serviceId: 'service-a', customerId: null, customer, address: {street: '1 Test Street', suburb: 'Lynbrook', state: 'VIC', postcode: '3975'},
+      preferredSlots: [{date: '2099-11-05', timeRange: 'morning', startTime: '10:30'}]};
+    assert.equal((await session.call('create_job_booking', {customerConfirmed: true})).status, 'PREPARATION_REQUIRED');
+    await session.call('list_services', {});
+    await session.call('get_available_slots', {from: '2099-11-05', to: '2099-11-05'});
+    assert.equal((await session.call('prepare_job_booking', details)).status, 'READY_FOR_CONFIRMATION');
+    assert.equal((await session.call('create_job_booking', {customerConfirmed: true})).status, 'PENDING_REVIEW');
+    assert.equal((await session.call('create_job_booking', {customerConfirmed: true})).status, 'PENDING_REVIEW');
+    const sent = f.calls.filter(call => call.name === 'create_job_booking');
+    assert.equal(sent.length, 1); assert.equal(sent[0].args.preferredSlots[0].startTime, '10:30'); assert.ok(sent[0].args.requestKey);
+  } finally { await session?.close(); await f.close(); }
 });
