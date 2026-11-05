@@ -19,6 +19,7 @@ export const FAILED_STATUSES = Object.freeze(new Set([
 // Tools that save something. Repeated failures of these are capped.
 export const WRITE_TOOLS = Object.freeze(new Set([
   'create_booking', 'create_inspection_request', 'register_customer', 'complete_business_onboarding',
+  'create_job_booking', 'reschedule_job', 'cancel_job',
 ]));
 
 const hasSlots = result => Array.isArray(result?.slots) && result.slots.length > 0;
@@ -38,25 +39,36 @@ export const FLOWS = Object.freeze({
     },
   },
 
-  // BMS Trade inspections and advice requests.
+  // BMS Trade inspections, advice requests and jobs.
+  // A job booking walks the same steps as an inspection (prepare_job_booking, then
+  // create_job_booking). Moving or cancelling a job starts with find_job, which
+  // verifies the caller; a cancel needs no new date, so it also completes availability.
   trade: {
     steps: [
-      {id: 'service', doneBy: ['list_services', 'prepare_inspection_request'], optional: true, hint: 'Find out whether the caller wants a listed service (use list_services) or advice, and note the scope of work.'},
-      {id: 'address', doneBy: ['prepare_inspection_request'], optional: true, hint: 'Collect the site address: street, suburb, state and four-digit postcode.'},
-      {id: 'availability', doneBy: ['get_available_slots'], hint: 'Ask for a preferred date and morning or afternoon, and check get_available_slots for that date now.'},
-      {id: 'contact', doneBy: ['find_customer', 'register_customer', 'prepare_inspection_request'], hint: 'Collect full name, mobile and email. A guest booking is fine.'},
-      {id: 'readback', doneBy: ['prepare_inspection_request'], hint: 'Call prepare_inspection_request with the collected details, then read the summary back once.'},
-      {id: 'submitted', doneBy: ['create_inspection_request'], hint: 'After the caller agrees, call create_inspection_request with customerConfirmed=true.'},
+      {id: 'service', doneBy: ['list_services', 'prepare_inspection_request', 'prepare_job_booking', 'find_job'], optional: true, hint: 'Find out whether the caller wants a listed service (use list_services), advice, or a change to an existing job, and note the scope of work.'},
+      {id: 'address', doneBy: ['prepare_inspection_request', 'prepare_job_booking', 'find_job'], optional: true, hint: 'Collect the site address: street, suburb, state and four-digit postcode.'},
+      {id: 'availability', doneBy: ['get_available_slots', 'cancel_job'], hint: 'Ask for a preferred date and morning or afternoon, and check get_available_slots for that date now.'},
+      {id: 'contact', doneBy: ['find_customer', 'register_customer', 'prepare_inspection_request', 'prepare_job_booking', 'find_job'], hint: 'Collect full name, mobile and email. A guest booking is fine.'},
+      {id: 'readback', doneBy: ['prepare_inspection_request', 'prepare_job_booking', 'reschedule_job', 'cancel_job'], hint: 'Call prepare_inspection_request (or prepare_job_booking for a job) with the collected details, then read the summary back once.'},
+      {id: 'submitted', doneBy: ['create_inspection_request', 'create_job_booking', 'reschedule_job', 'cancel_job'], hint: 'After the caller agrees, call create_inspection_request (or create_job_booking, reschedule_job or cancel_job) with customerConfirmed=true.'},
     ],
     gates: {
       prepare_inspection_request: ['availability'],
       create_inspection_request: ['readback'],
+      prepare_job_booking: ['availability'],
+      create_job_booking: ['readback'],
+      reschedule_job: ['availability'],
     },
     success: {
       prepare_inspection_request: result => result?.status === 'READY_FOR_CONFIRMATION',
       create_inspection_request: result => ['PENDING_REVIEW', 'CONFIRMED'].includes(result?.status),
       register_customer: result => ['CREATED', 'EXISTS'].includes(result?.status),
       find_customer: result => ['MATCHED', 'NOT_FOUND'].includes(result?.status),
+      prepare_job_booking: result => result?.status === 'READY_FOR_CONFIRMATION',
+      create_job_booking: result => ['PENDING_REVIEW', 'CONFIRMED'].includes(result?.status),
+      find_job: result => result?.status === 'MATCHED',
+      reschedule_job: result => result?.status === 'CONFIRMED',
+      cancel_job: result => result?.status === 'CANCELLED',
     },
   },
 
