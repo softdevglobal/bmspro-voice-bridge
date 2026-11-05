@@ -1,13 +1,13 @@
-import {VOICE_TOOLS, checkBusinessTools} from './business-tools.mjs';
-import {loadTenantRoutes, resolveConfigForDid} from './tenant-routing.mjs';
-import {openOnboardingSession, ONBOARDING_TOOLS} from './onboarding-tools.mjs';
-import {openTradeSession} from './trade-tools.mjs';
-import {openPinkSession} from './pink-tools.mjs';
+import {VOICE_TOOLS, checkBusinessTools} from '../src/agents/black/business-tools.mjs';
+import {loadTenantRoutes, resolveConfigForDid} from '../src/routing/tenant-routing.mjs';
+import {openOnboardingSession, ONBOARDING_TOOLS} from '../src/agents/onboarding/onboarding-tools.mjs';
+import {openTradeSession} from '../src/agents/trade/trade-tools.mjs';
+import {openPinkSession} from '../src/agents/pink/pink-tools.mjs';
 
 try {
   const routes = loadTenantRoutes();
   const did = process.argv[2];
-  if (!did) throw new Error('Specify a DID to verify: node --env-file=.env check-mcp.mjs 0359111403. No DID list is stored on the bridge.');
+  if (!did) throw new Error('Specify a DID to verify: node --env-file=.env scripts/check-mcp.mjs 0359111403. No DID list is stored on the bridge.');
   const config = await resolveConfigForDid(did, routes);
   console.log(`DID route: mode=${config.mode} endpoint=${config.url}`);
   if (config.mode === 'onboarding') {

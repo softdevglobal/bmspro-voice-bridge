@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createDraftTypingCue, pcmuHasSpeech} from './draft-typing.mjs';
+import {createDraftTypingCue, pcmuHasSpeech} from '../src/audio/draft-typing.mjs';
 
 test('typing waits for a slow save and an answered, speech-free playback window', () => {
   let time = 0;

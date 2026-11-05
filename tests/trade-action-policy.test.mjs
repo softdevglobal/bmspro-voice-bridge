@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createTradeActionPolicy} from './trade-action-policy.mjs';
+import {createTradeActionPolicy} from '../src/agents/trade/trade-action-policy.mjs';
 
 const names = ['get_business_profile', 'list_services', 'find_customer', 'get_available_slots', 'register_customer', 'create_inspection_request'];
 const customer = {fullName: 'Test Customer', email: 'test@example.test', phone: '0412345678'};

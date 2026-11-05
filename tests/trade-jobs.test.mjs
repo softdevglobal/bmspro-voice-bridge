@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createTradeActionPolicy} from './trade-action-policy.mjs';
+import {createTradeActionPolicy} from '../src/agents/trade/trade-action-policy.mjs';
 
 const jobTools = ['find_job', 'create_job_booking', 'reschedule_job', 'cancel_job'];
 const base = ['get_business_profile', 'list_services', 'find_customer', 'get_available_slots'];
