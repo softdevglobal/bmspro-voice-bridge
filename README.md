@@ -25,7 +25,7 @@ bmspro-voice-bridge/
 ├─ tests/                          node --test suites
 ├─ scripts/                        check-mcp.mjs, diagnose-trade.mjs
 ├─ deploy/asterisk/                extensions.conf / websocket_client.conf examples
-└─ docs/                           Setup guides and FUNCTIONS_AND_FLOW.md (diagrams)
+└─ docs/                           Setup guides, FUNCTIONS_AND_FLOW.md (diagrams), AI_AGENT_BRIDGE_VS_TRADE.md
 ```
 
 Commands:

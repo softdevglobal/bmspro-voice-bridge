@@ -8,9 +8,12 @@ import {openAgentSession, openingGreeting} from '../agents/registry.mjs'; // mod
 import {createDialogManager, dialogModeFromEnv, DIALOG_INSTRUCTIONS} from '../dialog/dialog-manager.mjs'; // per-call conversation steps and write gates
 import {loadTenantRoutes, resolveMediaStartRoute} from '../routing/tenant-routing.mjs'; // dialled number (DID) business routing
 import {createInputAudioClock, createPacedAudioTimer} from '../audio/input-audio.mjs'; // paced audio send/receive timers
-import {createDraftTypingCue, pcmuHasSpeech} from '../audio/draft-typing.mjs'; // typing sound 
+import {createDraftTypingCue, pcmuHasSpeech} from '../audio/draft-typing.mjs'; // typing sound
+import {createBargeInDetector} from '../audio/barge-in.mjs'; // stop Sophie when the caller starts talking
+import {END_CALL_TOOL, END_CALL_VOICE_RULE, END_CALL_BACKEND_RULE, createHangupController} from '../agents/end-call.mjs'; // Sophie can end the call after a goodbye
 import {createVoiceStudioShadow} from '../asr/voice-studio-shadow.mjs'; // side by side seech to text test
 import {createCallTranscript} from '../observability/call-transcript.mjs'; // per-call transcript file writer
+import {createCallRecord, sendTradeCallRecord} from '../observability/call-record.mjs'; // call log saved to Trade (Firebase) after hang-up
 
 // Independent tenant and tool state per call; no application duration cutoff.
 // Refuse to start without the OpenAI Api key.
@@ -53,7 +56,19 @@ const maxCalls = Number(process.env.BMSPRO_MAX_CONCURRENT_CALLS || 4); // max si
 if (!Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > 32) throw new Error('BMSPRO_MAX_CONCURRENT_CALLS must be an integer from 1 to 32.');
 const port = Number(process.env.BMSPRO_PORT || 8787); // listening port
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('BMSPRO_PORT must be an integer from 1 to 65535.');
-const bindHost = process.env.BMSPRO_BIND_HOST?.trim() || '127.0.0.1'; // address to bind 
+// Playback lead (jitter buffer). Asterisk's chan_websocket queues the frames it
+// receives and plays them on its own 20 ms clock, inserting silence whenever the
+// queue is empty. Sending exactly one frame per 20 ms keeps that queue near empty,
+// so any network delay between the bridge and Asterisk (for example an SSH tunnel)
+// becomes silence in the middle of words. A lead keeps this much audio queued in
+// Asterisk so short delays are absorbed, at the cost of the same fixed delay.
+// 0 = off (bridge on the same server as Asterisk). Try 200-300 over a tunnel.
+const playbackLeadMs = Number(process.env.BMSPRO_PLAYBACK_LEAD_MS || 0);
+if (!Number.isInteger(playbackLeadMs) || playbackLeadMs < 0 || playbackLeadMs > 1000) throw new Error('BMSPRO_PLAYBACK_LEAD_MS must be an integer from 0 to 1000.');
+const playbackLeadFrames = Math.round(playbackLeadMs / 20);
+// Barge-in is on unless explicitly disabled (BMSPRO_BARGE_IN=false).
+const bargeInEnabled = process.env.BMSPRO_BARGE_IN !== 'false';
+const bindHost = process.env.BMSPRO_BIND_HOST?.trim() || '127.0.0.1'; // address to bind
 const bindOctets = bindHost.split('.').map(Number); 
 const bindIsLoopback = bindHost === '127.0.0.1' || bindHost === '::1';
 // True only for a well-formed IPv4 address in the Tailscale range 100.64.0.0 - 100.127.255.255.
@@ -92,6 +107,8 @@ wss.on('connection', media => {
     callId, directory: process.env.BMSPRO_TRANSCRIPTS_DIR || './transcripts',
     onError: () => log('Transcript file could not be written; call continues.'),
   });
+  // In-memory call log, sent to Trade after hang-up (direct Trade calls only).
+  const callRecord = createCallRecord({callId});
   let endReason = 'call ended';
   const safeCode = value => String(value ?? 'unknown').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 100);
   const safeDiagnostic = value => String(value ?? 'unknown').replace(/[\r\n\t]+/g, ' ')
@@ -106,7 +123,21 @@ wss.on('connection', media => {
   const handledCalls = new Set();
   let queue = Buffer.alloc(0), finalTimer;
   const draftTyping = createDraftTypingCue({onPlayback: () => log(`Typing audio: playback started (v4); mode=${safeCode(businessConfig?.mode)}.`)});
-  let lastSpeechPlaybackAt = -Infinity;
+  let lastSpeechPlaybackAt = -Infinity, leadSent = false;
+  const bargeIn = createBargeInDetector();
+  const hangup = createHangupController();
+  // Caller started a new turn: drop Sophie's queued (now stale) audio so she
+  // stops straight away, like a person would. Asterisk's small playback lead is
+  // flushed too and rebuilt before her next words.
+  const interruptPlayback = () => {
+    const sophieAudible = queue.length >= 800 || performance.now() - lastSpeechPlaybackAt < 400;
+    if (!bargeInEnabled || !sophieAudible) return;
+    const droppedMs = Math.round(queue.length / 8);
+    queue = Buffer.alloc(0);
+    draftTyping.stop();
+    if (playbackLeadFrames && leadSent) { command('FLUSH_MEDIA'); leadSent = false; }
+    log(`Barge-in: caller spoke; stopped Sophie and dropped ${droppedMs}ms of queued audio.`);
+  };
   let inputBytes = 0, outputBytes = 0;
   let setupStartedAt, backendReadyAt, liveReadyAt, answeredAt, firstAudioAt, firstPlaybackAt;
   let greetingTranscript = '', greetingNameConfirmed = false;
@@ -189,7 +220,11 @@ wss.on('connection', media => {
     draftTyping.stop();
     // A confirmed write already in flight may complete after hangup. Do not abort
     // it and retry: retain the backend's outcome and close the MCP session after it.
-    void toolQueue.then(() => businessSession?.close()).catch(() => {});
+    // The call log is sent once that outcome is known, so it records the real result.
+    callRecord.end(reason);
+    void toolQueue.catch(() => {})
+      .then(() => sendTradeCallRecord({config: businessConfig, businessId: businessSession?.profile?.businessId, record: callRecord, log}))
+      .then(() => businessSession?.close()).catch(() => {});
     queue = Buffer.alloc(0);
     reportActivity('call_ended', {status: safeCode(reason)});
     log(`Ended: ${reason}; input=${inputBytes} bytes output=${outputBytes} bytes`);
@@ -230,15 +265,20 @@ wss.on('connection', media => {
       if (closing) return;
       const toolStartedAt = performance.now();
       let result;
-      const allowed = businessSession?.tools.some(tool => tool.name === item.name) === true;
+      const endCall = item.name === END_CALL_TOOL.name;
+      const allowed = endCall || businessSession?.tools.some(tool => tool.name === item.name) === true;
       try {
         if (!allowed || typeof item.arguments !== 'string' || item.arguments.length > (businessConfig.mode === 'onboarding' ? 65536 : 8192))
           throw new Error('Invalid tool request');
         const args = JSON.parse(item.arguments);
         // Dialog manager: block a write whose earlier steps are not done yet.
-        const blocked = dialog?.check(item.name) ?? null;
+        const blocked = endCall ? null : dialog?.check(item.name) ?? null;
         if (blocked) result = blocked;
-        else {
+        else if (endCall) {
+          // Handled by the bridge: hang up once Sophie's goodbye has played (see the audio pump).
+          result = hangup.request(performance.now());
+          log('End call: requested by Sophie; hanging up after her goodbye.');
+        } else {
           draftTyping.start();
           result = await businessSession.call(item.name, args);
         }
@@ -251,7 +291,7 @@ wss.on('connection', media => {
             ['UNAVAILABLE', 'REJECTED', 'UNKNOWN', 'STEP_REQUIRED', 'RETRY_LIMIT'].includes(result.status)) draftTyping.stop();
       }
       // Dialog manager: update progress, then add the current step and next hint for the AI.
-      if (allowed) dialog?.record(item.name, result);
+      if (allowed && !endCall) dialog?.record(item.name, result);
       const resultText = JSON.stringify(dialog ? dialog.annotate(result) : result);
       const rejectionCodes = new Map([
         ["Black's safe AI booking contract is not deployed. Transfer to staff.", 'BLACK_AI_BOOKING_CONTRACT_NOT_READY'],
@@ -268,6 +308,7 @@ wss.on('connection', media => {
         : undefined;
       const reason = result.status === 'REJECTED' ? ` reason=${backendCode || rejectionCodes.get(result.message) || 'UNCLASSIFIED_REJECTION'}` : '';
       reportActivity('mcp_tool', {toolName: safeCode(allowed ? item.name : 'unexpected'), status: safeCode(result.status || 'completed'), durationMs: Math.round(performance.now() - toolStartedAt)});
+      callRecord.tool(allowed ? item.name : 'unexpected', result, performance.now() - toolStartedAt);
       if (allowed && item.name === 'submit_for_owner_review') {
         const notifications = result.reviewNotifications;
         log(`Owner review notifications: sms=${safeCode(notifications?.sms?.status || 'not_reported')} smsCode=${safeCode(notifications?.sms?.code || 'none')} email=${safeCode(notifications?.email?.status || 'not_reported')} emailCode=${safeCode(notifications?.email?.code || 'none')}`);
@@ -294,6 +335,13 @@ wss.on('connection', media => {
     // Keep the beginning of the greeting queued while the answered SIP/RTP
     // path settles. Continue sending silence without discarding speech.
     const playbackReady = answeredAt !== undefined && performance.now() - answeredAt >= 400;
+    // Once, when playback starts: queue the jitter-buffer lead in Asterisk as
+    // silence. From then on one frame per tick keeps that lead constant.
+    if (playbackReady && !leadSent) {
+      leadSent = true;
+      for (let i = 0; i < playbackLeadFrames; i++) media.send(Buffer.alloc(160, 0xff));
+      if (playbackLeadFrames) log(`Playback lead: ${playbackLeadFrames * 20}ms queued in Asterisk.`);
+    }
     const length = playbackReady ? Math.min(160, queue.length) : 0;
     const frame = Buffer.alloc(160, 0xff);
     queue.copy(frame, 0, 0, length); queue = queue.subarray(length);
@@ -307,6 +355,8 @@ wss.on('connection', media => {
     const typingFrame = draftTyping.frame(!speech && answeredAt !== undefined && performance.now() - lastSpeechPlaybackAt >= 180);
     if (typingFrame) typingFrame.copy(frame);
     media.send(frame); outputBytes += typingFrame ? frame.length : length;
+    if (hangup.shouldHangUp({now: performance.now(), queuedBytes: queue.length, lastSpeechPlaybackAt}))
+      return finish('Sophie ended the call after saying goodbye');
     if (length && firstPlaybackAt === undefined) {
       firstPlaybackAt = performance.now();
       log(`First audio sent to Asterisk: answerToPlaybackMs=${Math.round(firstPlaybackAt - answeredAt)} totalSetupMs=${Math.round(firstPlaybackAt - setupStartedAt)}`);
@@ -350,6 +400,8 @@ wss.on('connection', media => {
         return finish('missing or invalid route marker, backend DID routing failure, or unmapped DID');
       }
       activityConfig = businessConfig;
+      // Optional: the dialplan may pass the caller's number as BMS_CALLER_ID.
+      callRecord.caller(event.channel_variables?.BMS_CALLER_ID ?? event.channel_variables?.__BMS_CALLER_ID);
       if (voiceStudioShadowEnabled && voiceStudioShadowDids.has(String(businessConfig.did || '').replace(/\D/g, ''))) {
         voiceStudioShadow = createVoiceStudioShadow({
           WebSocket,
@@ -408,6 +460,8 @@ wss.on('connection', media => {
             businessSession.voiceInstructions ?? voiceInstructions(businessConfig),
             'Your name is Sophie. Identify yourself as Sophie, the AI assistant, in the opening greeting. For onboarding, you are Sophie from BMS Pro helping with business setup; do not ask the caller to choose an AI receptionist name.',
             'Keep routine replies to one or two short sentences and ask one question at a time. If backend work takes time, briefly acknowledge the request while waiting; do not announce an unverified result.',
+            'If the caller starts talking while you are speaking, stop at once, listen to them and respond to what they said; do not finish or repeat the sentence you were saying.',
+            END_CALL_VOICE_RULE,
             businessSession.turnInstructions || '',
             dateInstructions,
           ].join(' '),
@@ -415,14 +469,20 @@ wss.on('connection', media => {
           // Pin one voice for the whole call; changing voices between routes sounds like speaker switching.
           audio: {format: {type: 'audio/pcmu', rate: 8000}, output: {voice: 'shimmer'}},
           delegation: {type: 'responses', responses: {
-            model: 'gpt-6-luna', tools: businessSession.tools, parallel_tool_calls: false,
-            instructions: [businessSession.backendInstructions ?? backendInstructions(businessConfig), businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : ''].join(' ')
+            model: 'gpt-6-luna', tools: [...businessSession.tools, END_CALL_TOOL], parallel_tool_calls: false,
+            instructions: [businessSession.backendInstructions ?? backendInstructions(businessConfig), END_CALL_BACKEND_RULE, businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : ''].join(' ')
           }}
         }});
       });
     // ---- Events coming from OpenAI Live ----
       live.on('event', event => {
         transcript?.event(event);
+        callRecord.event(event);
+        if (!closing && answeredAt !== undefined && bargeIn.isNewCallerTurn(event)) {
+          interruptPlayback();
+          // The caller is still talking after Sophie offered to end the call: stay on the line.
+          if (hangup.cancel()) log('End call: cancelled because the caller kept talking.');
+        }
         // Inspect only the beginning of assistant speech; never print transcript
         // content. This distinguishes generated wording from playback clipping.
         if (event.type === 'session.output_transcript.delta' && !greetingNameConfirmed && greetingTranscript.length < 1200) {
@@ -488,6 +548,8 @@ wss.on('connection', media => {
             answeredAt = performance.now();
             clearTimeout(setupTimer);
             reportActivity('call_answered', {status: 'answered'});
+            callRecord.answered();
+            callRecord.setup(firstAudioAt - setupStartedAt);
             log(`Audible greeting audio ready; answered call. greetingGenerationMs=${Math.round(firstAudioAt - liveReadyAt)} totalSetupMs=${Math.round(firstAudioAt - setupStartedAt)}`);
           }
           if (queue.length + chunk.length > 80000) return finish('output backlog exceeded ten seconds');

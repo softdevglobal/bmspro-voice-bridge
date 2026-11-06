@@ -1,6 +1,10 @@
-const MAX_PENDING_ULAW_BYTES = 8000; // One second at 8 kHz PCMU.
-const MAX_WS_BUFFERED_BYTES = 256_000;
 
+// Maximum amount of incoming u-law(PCMU) audio data
+const MAX_PENDING_ULAW_BYTES = 8000; // One second at 8 kHz PCMU.
+// Maximum amount of outgoing audio data that can wait
+const MAX_WS_BUFFERED_BYTES = 256_000;
+// PCM16 meansthe Pulse-Code Modulation 
+// way of representing audio as numerical values
 function ulawSampleToPcm16(byte) {
   const value = (~byte) & 0xff;
   const sign = value & 0x80;
@@ -21,6 +25,7 @@ function ulaw8kToPcm16k(input) {
     output.writeInt16LE(sample, i * 4);
     output.writeInt16LE(Math.round((sample + next) / 2), i * 4 + 2);
   }
+  // return the converted 16h kHz audio buffer
   return output;
 }
 
@@ -28,6 +33,7 @@ function safeCode(value) {
   return String(value ?? 'unknown').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 80) || 'unknown';
 }
 
+// create VoiceStudio shadow connection
 export function createVoiceStudioShadow({WebSocket, url, apiKey, log, logTranscripts = false}) {
   const report = message => { try { log(`VoiceStudio shadow: ${message}`); } catch {} };
   if (!apiKey) {
@@ -56,6 +62,7 @@ export function createVoiceStudioShadow({WebSocket, url, apiKey, log, logTranscr
     return null;
   }
 
+  // initialize  connection state and tracking variable
   let state = 'connecting';
   let ended = false;
   let failed = false;
@@ -67,6 +74,7 @@ export function createVoiceStudioShadow({WebSocket, url, apiKey, log, logTranscr
   let droppedBytes = 0;
   let finalEvents = 0;
 
+  // Release tempory resources and clear pending audio
   const cleanup = () => {
     clearTimeout(connectTimer);
     clearTimeout(closeTimer);
@@ -80,8 +88,8 @@ export function createVoiceStudioShadow({WebSocket, url, apiKey, log, logTranscr
     cleanup();
     report(`unavailable code=${safeCode(code)}; continuing the call on OpenAI.`);
     try { if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.terminate(); } catch {}
-  };
-  const sendAudio = ulaw => {
+  }; 
+  const sendAudio = ulaw => { // send audot to VoiceStudio
     if (state !== 'open' || socket.readyState !== WebSocket.OPEN) {
       droppedBytes += ulaw.length;
       return;

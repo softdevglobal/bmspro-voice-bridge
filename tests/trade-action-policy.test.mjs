@@ -116,3 +116,29 @@ test('advice can prepare and submit without a published service while retaining 
   assert.equal(sent[0].args.serviceId, null); assert.deepEqual(sent[0].args.customRequest, advice.customRequest);
   assert.equal(calls.some(call => call.name === 'list_services'), false);
 });
+
+test('knowledge search is allowed only when advertised, sends only the question and fails closed on bad results', async () => {
+  const off = createTradeActionPolicy(new Map(names.map(name => [name, {}])), async () => ({status: 'FOUND', passages: [{title: 't', text: 'x'}]}));
+  assert.ok(!off.names.includes('search_business_knowledge'));
+  assert.equal((await off.call('search_business_knowledge', {question: 'Is there a fee?'})).status, 'REJECTED');
+
+  const calls = [];
+  let reply = {status: 'FOUND', passages: [{title: 'Call-out fee', text: 'Call-out fee\n$90 in our area.'}], message: 'data'};
+  const policy = createTradeActionPolicy(new Map([...names, 'search_business_knowledge'].map(name => [name, {}])), async (name, args) => {
+    calls.push({name, args}); return reply;
+  });
+  assert.ok(policy.names.includes('search_business_knowledge'));
+  assert.equal((await policy.call('search_business_knowledge', {question: '  Is there a\ncall-out fee? '})).status, 'FOUND');
+  assert.deepEqual(calls.at(-1), {name: 'search_business_knowledge', args: {question: 'Is there a call-out fee?'}});
+
+  for (const bad of [{question: 'fee', businessId: 'b'}, {question: 'x'}, {question: 'a'.repeat(301)}, {question: 5}, {}])
+    assert.equal((await policy.call('search_business_knowledge', bad)).status, 'REJECTED');
+  assert.equal(calls.length, 1);
+
+  reply = {status: 'NO_MATCH', passages: [], message: 'none'};
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Do you work Sundays?'})).status, 'NO_MATCH');
+  for (const invalid of [{status: 'FOUND', passages: []}, {status: 'BOOKED', passages: []}, {status: 'FOUND', passages: [{title: 't', text: 'x'.repeat(2001)}]}, null]) {
+    reply = invalid;
+    assert.equal((await policy.call('search_business_knowledge', {question: 'Is there a fee?'})).status, 'UNAVAILABLE');
+  }
+});

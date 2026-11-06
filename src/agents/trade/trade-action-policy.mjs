@@ -54,6 +54,8 @@ export function createTradeActionPolicy(inventory, remote) {
   if (inventory.has('find_customer') && inventory.has('get_available_slots') && inventory.has('create_job_booking')) names.push('create_job_booking');
   // Changing a job needs this call's verified lookup and a live availability check first.
   for (const name of jobWrites) if (inventory.has('find_job') && inventory.has('get_available_slots') && inventory.has(name)) names.push(name);
+  // Read-only RAG search; advertised by Trade only when AI_VOICE_KNOWLEDGE_ENABLED=true.
+  if (inventory.has('search_business_knowledge')) names.push('search_business_knowledge');
   const unchecked = slots => slots.some(slot => {
     const latest = [...checks].reverse().find(check => slot.date >= check.from && slot.date <= check.to);
     return !latest || latest.unavailable.has(`${slot.date}:${slot.timeRange}`);
@@ -108,6 +110,11 @@ export function createTradeActionPolicy(inventory, remote) {
         if (!only(raw, ['from', 'to']) || !date(raw.from) || !date(raw.to) || raw.to < raw.from || (Date.parse(raw.to) - Date.parse(raw.from)) / 86400000 >= 90)
           return rejected('Choose valid from/to dates spanning 1-90 days.');
         args = {from: raw.from, to: raw.to};
+      } else if (name === 'search_business_knowledge') {
+        const question = typeof raw.question === 'string' ? raw.question.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim() : '';
+        if (!only(raw, ['question']) || question.length < 3 || question.length > 300)
+          return rejected('Ask one short question about this business, without customer names, emails or phone numbers.');
+        args = {question};
       } else {
         if (raw.customerConfirmed !== true) return {status: 'CONFIRMATION_REQUIRED', message: 'Read back the details and obtain explicit confirmation before this action.'};
         const customer = contact(raw.customer, true);
@@ -221,6 +228,12 @@ export function createTradeActionPolicy(inventory, remote) {
               result.unavailable.some(slot => !date(slot?.date) || !['morning', 'afternoon'].includes(slot.timeRange))) throw new Error('Invalid availability.');
           checks.push({from: args.from, to: args.to, unavailable: new Set(result.unavailable.map(slot => `${slot.date}:${slot.timeRange}`))});
           if (checks.length > 20) checks.shift();
+        }
+        if (name === 'search_business_knowledge') {
+          if (!['FOUND', 'NO_MATCH', 'REJECTED'].includes(result?.status) || !Array.isArray(result.passages) || result.passages.length > 8 ||
+              result.passages.some(passage => typeof passage?.title !== 'string' || typeof passage.text !== 'string' || passage.text.length > 2000))
+            throw new Error('Invalid knowledge result.');
+          if (result.status === 'FOUND' && !result.passages.length) throw new Error('Invalid knowledge result.');
         }
         return result;
       } catch {
