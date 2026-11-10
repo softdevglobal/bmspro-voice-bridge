@@ -6,7 +6,7 @@ import { WebSocket, WebSocketServer } from 'ws'; // WebSocket client (shadow ASR
 import {voiceInstructions, backendInstructions} from '../agents/black/business-tools.mjs'; // default Black prompts
 import {openAgentSession, openingGreeting} from '../agents/registry.mjs'; // mode -> agent session (Black, Trade, Pink, onboarding) and greeting
 import {createDialogManager, dialogModeFromEnv, DIALOG_INSTRUCTIONS} from '../dialog/dialog-manager.mjs'; // per-call conversation steps and write gates
-import {loadTenantRoutes, resolveMediaStartRoute} from '../routing/tenant-routing.mjs'; // dialled number (DID) business routing
+import {loadTenantRoutes, resolveConfigForDid, resolveMediaStartRoute} from '../routing/tenant-routing.mjs'; // dialled number (DID) business routing
 import {createInputAudioClock, createPacedAudioTimer} from '../audio/input-audio.mjs'; // paced audio send/receive timers
 import {createDraftTypingCue, pcmuHasSpeech} from '../audio/draft-typing.mjs'; // typing sound 
 import {createVoiceStudioShadow} from '../asr/voice-studio-shadow.mjs'; // side by side seech to text test
@@ -114,7 +114,7 @@ wss.on('connection', media => {
     .replace(/\b(?:sk|sess|re)_[A-Za-z0-9_-]{12,}\b/g, '[redacted-token]')
     .replace(/[^\x20-\x7E]/g, '?').slice(0, 240);
   let live, businessSession, businessConfig, voiceStudioShadow, connecting = false, ready = false, closing = false, paused = false, released = false;
-  let activityConfig, activityStartedAt, callerChannel, handoffAttempted = false;
+  let activityConfig, activityStartedAt, ownerDestination, handoffAttempted = false;
   let dialog = null; // per-call dialog manager, created once the agent session is open
   let toolQueue = Promise.resolve();
   const handledCalls = new Set();
@@ -123,6 +123,7 @@ wss.on('connection', media => {
   let lastSpeechPlaybackAt = -Infinity;
   let inputBytes = 0, outputBytes = 0;
   let setupStartedAt, backendReadyAt, liveReadyAt, answeredAt, firstAudioAt, firstPlaybackAt;
+  let toolsEnabled = false;
   let greetingTranscript = '', greetingNameConfirmed = false;
 
   // ---- Telemetry: POST call events to the backend. Failures are ignored so calls never break. ----
@@ -222,6 +223,20 @@ wss.on('connection', media => {
       live?.socket.platformSocket.terminate(); release();
     }
   };
+  const connectVoice = () => {
+    log('Connecting to OpenAI.');
+    live = new LiveWS(client, {reconnect: null, maxQueueSize: 64000});
+    live.on('error', error => {
+      // Avoid dumping SDK errors that can include credentials or caller content.
+      const detail = error?.error?.error ?? error?.error ?? error;
+      log(`OpenAI error; code=${safeCode(detail?.code)} type=${safeCode(detail?.type)} param=${safeCode(detail?.param)} clientEvent=${safeCode(detail?.client_event_id)} message=${safeDiagnostic(detail?.message)}`);
+      finish('OpenAI error; check model access, billing and server configuration');
+    });
+    live.socket.on('close', () => {
+      if (!closing) finish('OpenAI socket closed');
+      release();
+    });
+  };
   // ---- Caller -> OpenAI audio: paced sender with backpressure protection ----
   const inputAudio = createInputAudioClock({
     // Only send when OpenAI is ready, the call is open, and the upstream buffer is under 64 KB.
@@ -244,7 +259,7 @@ wss.on('connection', media => {
       if (closing) return;
       const toolStartedAt = performance.now();
       let result;
-      const allowed = businessSession?.tools.some(tool => tool.name === item.name) === true;
+      const allowed = toolsEnabled && businessSession?.tools.some(tool => tool.name === item.name) === true;
       try {
         if (!allowed || typeof item.arguments !== 'string' || item.arguments.length > (businessConfig.mode === 'onboarding' ? 65536 : 8192))
           throw new Error('Invalid tool request');
@@ -252,14 +267,19 @@ wss.on('connection', media => {
         // Dialog manager: block a write whose earlier steps are not done yet.
         const blocked = dialog?.check(item.name) ?? null;
         if (item.name === 'transfer_to_owner') {
-          if (!callerChannel || answeredAt === undefined || handoffAttempted ||
+          if (!ownerDestination || answeredAt === undefined || handoffAttempted ||
               !args || Object.keys(args).length !== 1 || args.callerConfirmed !== true) {
             log(`Owner handoff failed: ${handoffAttempted ? 'ALREADY_ATTEMPTED' : answeredAt === undefined ? 'CALL_NOT_ANSWERED' : 'CONFIRMATION_REQUIRED'}`);
             result = {status: 'UNAVAILABLE', message: 'The transfer was not started.'};
           } else {
             handoffAttempted = true;
             draftTyping.stop();
-            if (await redirectToOwner(ownerHandoff, callerChannel, undefined, reason => log(`Owner handoff failed: ${reason}`))) {
+            const current = await resolveConfigForDid(businessConfig.did, tenantRoutes).catch(() => null);
+            if (closing) return;
+            const stillMapped = current?.mode === 'trade' && current.businessId === businessConfig.businessId &&
+              current.forwardingExtension === ownerDestination.extension;
+            if (!stillMapped) log('Owner handoff failed: MAPPING_CHANGED_OR_UNAVAILABLE');
+            if (stillMapped && await redirectToOwner(ownerHandoff, ownerDestination, undefined, reason => log(`Owner handoff failed: ${reason}`))) {
               log('Owner handoff accepted by Asterisk.');
               return finish('owner handoff', false);
             }
@@ -360,6 +380,8 @@ wss.on('connection', media => {
       if (live || connecting) return finish('duplicate MEDIA_START');
       if (event.format !== 'ulaw' || Number(event.optimal_frame_size) !== 160)
         return finish('expected ulaw / 160-byte frames');
+      connecting = true;
+      const routingStartedAt = performance.now();
 
  // ---- Step 1: work out which business/mode this phone number belongs to ----
       try { businessConfig = await resolveMediaStartRoute(event, tenantRoutes); }
@@ -377,6 +399,8 @@ wss.on('connection', media => {
         log(`DID routing failed: code=${httpStatus ? `ROUTE_HTTP_${httpStatus}` : routeCodes.get(message) || 'ROUTE_UNAVAILABLE'}`);
         return finish('missing or invalid route marker, backend DID routing failure, or unmapped DID');
       }
+      if (closing) return;
+      log(`DID route ready: durationMs=${Math.round(performance.now() - routingStartedAt)}`);
       activityConfig = businessConfig;
       if (voiceStudioShadowEnabled && voiceStudioShadowDids.has(String(businessConfig.did || '').replace(/\D/g, ''))) {
         voiceStudioShadow = createVoiceStudioShadow({
@@ -389,79 +413,134 @@ wss.on('connection', media => {
       }
       activityStartedAt = Date.now();
       reportActivity('call_started', {status: 'routing'});
-      connecting = true;
       setupStartedAt = performance.now();
+      if (businessConfig.mode === 'trade') connectVoice();
+      const discoveredProfile = businessConfig.discoveredProfile;
+      let greetFirst = false;
+      if (businessConfig.mode === 'trade' && typeof discoveredProfile?.businessName === 'string' &&
+          discoveredProfile.businessName.trim() && typeof discoveredProfile.timezone === 'string') {
+        try {
+          new Intl.DateTimeFormat('en-AU', {timeZone: discoveredProfile.timezone});
+          greetFirst = true;
+        } catch { /* The regular MCP startup validates the profile before greeting. */ }
+      }
+      const toolsUpdateId = `trade_tools_${callId}`;
+      let toolsUpdateSent = false, setupFailed = false, callerSpokeBeforeTools = false, dateInstructions;
+      const backendPrompt = () => [
+        businessSession.backendInstructions ?? backendInstructions(businessConfig),
+        businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : '',
+      ].join(' ');
+      const steerVoice = (suffix, content) => live.send({
+        type: 'session.instructions.append', event_id: `${suffix}_${callId}`, delegation_id: null, content,
+      });
+      const resumeCaller = (suffix, content) => {
+        steerVoice(suffix, content);
+        if (callerSpokeBeforeTools) live.send({
+          type: 'session.commentary.append', event_id: `${suffix}_resume_${callId}`, delegation_id: null, content,
+        });
+      };
+      const enableTradeTools = () => {
+        if (!greetFirst || !ready || closing || toolsUpdateSent) return;
+        if (setupFailed) {
+          resumeCaller('trade_unavailable', 'Trade tools could not connect for this call. If the caller asked for an action, explain it could not be completed. Never claim a booking, lookup or transfer succeeded.');
+          return;
+        }
+        if (!businessSession) return;
+        toolsUpdateSent = true;
+        live.send({type: 'session.update', event_id: toolsUpdateId, session: {delegation: {
+          type: 'responses', responses: {tools: businessSession.tools, tool_choice: 'auto', instructions: backendPrompt()},
+        }}});
+      };
 
     // ---- Step 2: open the call-scoped MCP tool session for the matching mode ----     
-      log(`Opening a call-scoped ${businessConfig.mode} MCP session for DID ${businessConfig.did}.`);
-      const timing = {onTiming: (phase, elapsedMs) => log(`MCP startup: phase=${phase} durationMs=${elapsedMs}`)};
-      try {
-        businessSession = await openAgentSession(businessConfig, timing);
-      } catch (error) {
-        log(`MCP setup failed: mode=${businessConfig.mode} code=${safeCode(error?.code)}`);
-        return finish('MCP setup unavailable; check endpoint, feature flags and DID assignment');
-      }
-      if (closing) { await businessSession.close(); return; }
-      backendReadyAt = performance.now();
-      log(`MCP ready: setupMs=${Math.round(backendReadyAt - setupStartedAt)}`);
-      businessConfig = businessSession.config;
-      const handoff = ownerHandoffReadiness(ownerHandoff, businessConfig, event.channel_variables);
-      callerChannel = handoff.channel;
-      if (handoff.status !== 'NOT_NIRA_ROUTE') log(`Owner handoff: ${handoff.status}`);
-      if (callerChannel) {
-        businessSession.tools.push({
-          type: 'function', name: 'transfer_to_owner', strict: false,
-          description: 'Transfer the live caller to the business owner. Offer when the caller asks for a human or you cannot help. Wait for a clear yes, say you will put them through, then call once.',
-          parameters: {type: 'object', properties: {callerConfirmed: {type: 'boolean', const: true}},
-            required: ['callerConfirmed'], additionalProperties: false},
+      const prepareBusiness = async () => {
+        log(`Opening a call-scoped ${businessConfig.mode} MCP session for DID ${businessConfig.did}.`);
+        const timing = {onTiming: (phase, elapsedMs) => log(`MCP startup: phase=${phase} durationMs=${elapsedMs}`)};
+        try {
+          businessSession = await openAgentSession(businessConfig, timing);
+        } catch (error) {
+          log(`MCP setup failed: mode=${businessConfig.mode} code=${safeCode(error?.code)}`);
+          if (greetFirst) {
+            setupFailed = true;
+            enableTradeTools();
+            return;
+          }
+          return finish('MCP setup unavailable; check endpoint, feature flags and DID assignment');
+        }
+        if (closing) { await businessSession.close(); return; }
+        backendReadyAt = performance.now();
+        log(`MCP ready: setupMs=${Math.round(backendReadyAt - setupStartedAt)}`);
+        businessConfig = businessSession.config;
+        const handoff = ownerHandoffReadiness(ownerHandoff, businessConfig, event.channel_variables);
+        if (handoff.status !== 'NOT_TRADE_ROUTE') log(`Owner handoff: ${handoff.status}`);
+        if (handoff.status === 'READY') {
+          ownerDestination = handoff;
+          businessSession.tools.push({
+            type: 'function', name: 'transfer_to_owner', strict: false,
+            description: 'Transfer the live caller to the business owner. Offer when the caller asks for a human or you cannot help. Wait for a clear yes, say you will put them through, then call once.',
+            parameters: {type: 'object', properties: {callerConfirmed: {type: 'boolean', const: true}},
+              required: ['callerConfirmed'], additionalProperties: false},
+          });
+          const handoffInstructions = ' For this call, transfer_to_owner is available. If the caller asks for a person or you cannot help, offer to connect them to the owner. Wait for a clear yes, tell them you will put them through, then call transfer_to_owner once. If it fails, explain that you could not connect them.';
+          businessSession.voiceInstructions = businessSession.voiceInstructions.replace(' or transfer actions', '') + handoffInstructions;
+          businessSession.backendInstructions += handoffInstructions;
+        }
+        if (dialogMode !== 'off') dialog = createDialogManager({mode: businessConfig.mode, enforce: dialogMode === 'on', log});
+        transcript?.metadata({did: businessConfig.did, mode: businessConfig.mode,
+          businessName: businessConfig.businessName || businessConfig.workshop, businessId: businessConfig.businessId || businessSession.profile?.businessId});
+        if (businessConfig && activityConfig) {
+          activityConfig = {...activityConfig, ...businessConfig, url: activityConfig.url, token: activityConfig.token, did: activityConfig.did};
+        }
+        enableTradeTools();
+      };
+      if (greetFirst) {
+        void prepareBusiness().catch(() => {
+          setupFailed = true;
+          enableTradeTools();
         });
-        const handoffInstructions = ' For this call, transfer_to_owner is available. If the caller asks for a person or you cannot help, offer to connect them to the owner. Wait for a clear yes, tell them you will put them through, then call transfer_to_owner once. If it fails, explain that you could not connect them.';
-        businessSession.voiceInstructions = businessSession.voiceInstructions.replace(' or transfer actions', '') + handoffInstructions;
-        businessSession.backendInstructions += handoffInstructions;
-      }
-      if (dialogMode !== 'off') dialog = createDialogManager({mode: businessConfig.mode, enforce: dialogMode === 'on', log});
-      transcript?.metadata({did: businessConfig.did, mode: businessConfig.mode,
-        businessName: businessConfig.businessName || businessConfig.workshop, businessId: businessConfig.businessId || businessSession.profile?.businessId});
-      if (businessConfig && activityConfig) {
-        activityConfig = {...activityConfig, ...businessConfig, url: activityConfig.url, token: activityConfig.token, did: activityConfig.did};
+      } else {
+        await prepareBusiness();
+        if (closing) return;
+        toolsEnabled = true;
       }
 
          // ---- Step 3: pick the fixed Sophie greeting for this mode ---- 
-      log('Connecting to OpenAI.');
-      const greeting = openingGreeting(businessConfig); // fixed Sophie greeting for this mode (agents/registry.mjs)
+      const greeting = greetFirst
+        ? `Greet the caller in English: "Hi, thanks for calling ${JSON.stringify(discoveredProfile.businessName)}. My name is Sophie, your AI receptionist. How can I help?" Then pause and listen. Pronounce Sophie as SOH-fee.`
+        : openingGreeting(businessConfig);
       
       // ---- Step 4: open the OpenAI Live (realtime voice) connection ----
-      live = new LiveWS(client, {reconnect: null, maxQueueSize: 64000});
-      live.on('error', error => {
-        // Do not dump SDK errors: headers, secrets or caller content may be included.
-        const detail = error?.error?.error ?? error?.error ?? error;
-        log(`OpenAI error; code=${safeCode(detail?.code)} type=${safeCode(detail?.type)} param=${safeCode(detail?.param)} clientEvent=${safeCode(detail?.client_event_id)} message=${safeDiagnostic(detail?.message)}`);
-        finish('OpenAI error; check model access, billing and server configuration');
-      });
-      live.socket.on('open', () => {
+      if (!live) connectVoice();
+      const startVoice = () => {
         if (closing) return live.socket.platformSocket.terminate();
-        const timeZone = businessSession.profile?.timezone || businessConfig.timezone || 'Australia/Melbourne';
+        const timeZone = businessSession?.profile?.timezone || (greetFirst ? discoveredProfile.timezone : businessConfig.timezone) || 'Australia/Melbourne';
         const localNow = new Intl.DateTimeFormat('en-AU', {timeZone, dateStyle: 'full', timeStyle: 'short'}).format(new Date());
-        const dateInstructions = `At session start the current local date and time is ${localNow}, timezone ${timeZone}. Use this to resolve today, tomorrow and dates without a year. Clarify ambiguous dates immediately, before any other form field; never invent a weekday or postpone the year question until submission. Use ISO dates including the resolved year in tools.`;
-        log('Conversation flow v11: portal questions only; service and advice inspections can schedule when Trade confirms staff.');
+        dateInstructions = `At session start the current local date and time is ${localNow}, timezone ${timeZone}. Use this to resolve today, tomorrow and dates without a year. Clarify ambiguous dates immediately, before any other form field; never invent a weekday or postpone the year question until submission. Use ISO dates including the resolved year in tools.`;
+        log(greetFirst ? 'Trade greeting-first startup: MCP can load after greeting.' :
+          'Conversation flow v11: portal questions only; service and advice inspections can schedule when Trade confirms staff.');
         live.send({type: 'session.start', session: {
           model: 'gpt-live-1', store: false,
           instructions: [
-            businessSession.voiceInstructions ?? voiceInstructions(businessConfig),
+            greetFirst
+              ? `You are the receptionist for ${JSON.stringify(discoveredProfile.businessName)}. Greet and listen while Trade connects. If a caller asks for a booking, business lookup or transfer before the tools are ready, acknowledge their request briefly and retain what they said. Wait for the tool-ready instruction before delegating. Never invent business details or claim an action succeeded without a verified result.`
+              : businessSession.voiceInstructions ?? voiceInstructions(businessConfig),
             'Your name is Sophie. Identify yourself as Sophie, the AI assistant, in the opening greeting. For onboarding, you are Sophie from BMS Pro helping with business setup; do not ask the caller to choose an AI receptionist name.',
             'Keep routine replies to one or two short sentences and ask one question at a time. If backend work takes time, briefly acknowledge the request while waiting; do not announce an unverified result.',
-            businessSession.turnInstructions || '',
+            greetFirst ? '' : businessSession.turnInstructions || '',
             dateInstructions,
           ].join(' '),
           input: [{role: 'developer', content: [{type: 'input_text', text: greeting}]}],
           // Pin one voice for the whole call; changing voices between routes sounds like speaker switching.
           audio: {format: {type: 'audio/pcmu', rate: 8000}, output: {voice: 'shimmer'}},
           delegation: {type: 'responses', responses: {
-            model: 'gpt-6-luna', tools: businessSession.tools, parallel_tool_calls: false,
-            instructions: [businessSession.backendInstructions ?? backendInstructions(businessConfig), businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : ''].join(' ')
+            model: 'gpt-6-luna', parallel_tool_calls: false,
+            ...(greetFirst ? {
+              tools: [], tool_choice: 'none',
+              instructions: 'Trade is connecting. Retain the caller’s request and acknowledge it briefly. Do not claim an action was performed.',
+            } : {tools: businessSession.tools, instructions: backendPrompt()}),
           }}
         }});
-      });
+      };
     // ---- Events coming from OpenAI Live ----
       live.on('event', event => {
         transcript?.event(event);
@@ -477,6 +556,11 @@ wss.on('connection', media => {
         }
         if (event.type === 'error') {
           log(`OpenAI server error: code=${safeCode(event.error?.code)} type=${safeCode(event.error?.type)} param=${safeCode(event.error?.param)} clientEvent=${safeCode(event.error?.client_event_id)} message=${safeDiagnostic(event.error?.message)}`);
+          if (!closing && event.error?.client_event_id === toolsUpdateId) {
+            setupFailed = true;
+            toolsEnabled = false;
+            resumeCaller('trade_update_failed', 'Trade tools are unavailable. If the caller requested an action, explain it could not be completed.');
+          }
         }
         // Log types and error codes only: never transcripts, audio, keys or session snapshots.
         if (event.type !== 'session.output_audio.delta' && !event.type.includes('transcript'))
@@ -490,7 +574,7 @@ wss.on('connection', media => {
           const nested = event.event ?? event.response_event;
           if (!closing && nested?.type === 'response.output_item.added' &&
               nested.item?.type === 'function_call' &&
-              businessSession.tools.some(tool => tool.name === nested.item.name)) draftTyping.start();
+              toolsEnabled && businessSession?.tools.some(tool => tool.name === nested.item.name)) draftTyping.start();
           if (nested?.type === 'response.failed' || nested?.type === 'error' ||
               (nested?.type === 'response.done' && ['failed', 'cancelled', 'incomplete'].includes(nested.response?.status))) draftTyping.stop();
           if (nested?.type === 'response.output_item.done' && nested.item?.type === 'function_call') runTool(nested.item);
@@ -505,6 +589,15 @@ wss.on('connection', media => {
           live.close(); release(); return;
         }
         if (closing) return;
+        if (greetFirst && !toolsEnabled && event.type === 'session.input_transcript.delta' && event.delta?.trim()) {
+          callerSpokeBeforeTools = true;
+        }
+        if (event.type === 'session.updated' && toolsUpdateSent && !toolsEnabled && !setupFailed &&
+            (!event.client_event_id || event.client_event_id === toolsUpdateId)) {
+          toolsEnabled = true;
+          log(`Trade tools attached: totalSetupMs=${Math.round(performance.now() - setupStartedAt)}`);
+          resumeCaller('trade_ready', 'Trade tools are ready. If the caller is waiting on a request, continue it now using the details they already gave. Delegate business facts, availability, bookings and transfers to the backend. Ask only the next question required by the backend workflow. Confirm actions only from verified tool results.');
+        }
         if (event.type === 'session.started') {
           if (ready) return;
           ready = true;
@@ -514,7 +607,8 @@ wss.on('connection', media => {
           // the media clock running; do not wait for caller speech to trigger it.
           live.send({type: 'session.commentary.append', event_id: `greeting_${callId}`, delegation_id: null, content: greeting});
           log('Greeting v3: requested Sophie introduction; playback guard=400ms.');
-          log(`OpenAI ready; generating opening greeting before answer. openAiSetupMs=${Math.round(liveReadyAt - backendReadyAt)} totalSetupMs=${Math.round(liveReadyAt - setupStartedAt)}`);
+          log(`OpenAI ready; generating opening greeting before answer. voiceReadyMs=${Math.round(liveReadyAt - (greetFirst ? setupStartedAt : backendReadyAt))} totalSetupMs=${Math.round(liveReadyAt - setupStartedAt)}`);
+          enableTradeTools();
         }
         if (event.type === 'session.output_audio.delta' && ready) {
           const chunk = Buffer.from(event.delta, 'base64');
@@ -536,10 +630,8 @@ wss.on('connection', media => {
           queue = Buffer.concat([queue, chunk]);
         }
       });
-      live.socket.on('close', () => {
-        if (!closing) finish('OpenAI socket closed');
-        release();
-      });
+      if (live.socket.readyState === WebSocket.OPEN) startVoice();
+      else live.socket.on('open', startVoice);
     } catch { finish('invalid event or connection error'); }
   });
   media.on('error', () => finish('Asterisk socket error'));

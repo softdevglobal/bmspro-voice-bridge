@@ -60,13 +60,15 @@ export async function openTradeSession(config, {onTiming} = {}) {
   };
   try {
     await timed('initialize', () => client.connect(transport, {timeout: 15000}));
-    const [listed, profileResult] = await Promise.all([
+    // Direct discovery already verified this DID and business. MCP requests
+    // still carry the business pin and Trade authorizes it on every request.
+    const [listed, profile] = await Promise.all([
       timed('tool_inventory', () => client.listTools({}, {timeout: 15000})),
-      timed('trade_profile', () => client.callTool({name: 'get_business_profile', arguments: {}}, undefined, {timeout: 30000})),
+      config.discoveredProfile ?? timed('trade_profile', async () =>
+        decode(await client.callTool({name: 'get_business_profile', arguments: {}}, undefined, {timeout: 30000}))),
     ]);
     const inventory = new Map(listed.tools.map(tool => [tool.name, tool]));
     for (const name of TRADE_READ_TOOLS) if (!inventory.has(name)) throw new Error('Missing Trade read tool.');
-    const profile = decode(profileResult);
     if (profile?.brand !== 'trade' || String(profile.did).replace(/^\+/, '') !== config.did ||
         typeof profile.businessId !== 'string' || !profile.businessId || profile.businessId.length > 128 || profile.businessId.includes('/') ||
         (pinnedBusinessId && profile.businessId !== pinnedBusinessId) ||

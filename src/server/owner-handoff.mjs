@@ -1,36 +1,37 @@
 import {createConnection} from 'node:net';
 
-const niraDid = '0359111403';
 const channelPattern = /^PJSIP\/yeastar-[a-f0-9]+$/i;
 const validChannel = channel => typeof channel === 'string' && channel === channel.trim() && channelPattern.test(channel);
+const validExtension = extension => typeof extension === 'string' && extension === extension.trim() &&
+  /^\d{2,11}$/.test(extension) && extension !== '2000';
 
 export function loadOwnerHandoff(env = process.env) {
-  const businessId = env.BMSPRO_NIRA_HANDOFF_BUSINESS_ID?.trim();
   const username = env.BMSPRO_HANDOFF_AMI_USER?.trim();
   const secret = env.BMSPRO_HANDOFF_AMI_SECRET?.trim();
-  if (!businessId && !username && !secret) return null;
-  if (!businessId || !username || !secret || secret.length < 32 ||
-      [businessId, username, secret].some(value => /[\r\n\0]/.test(value))) {
-    throw new Error('Configure the Nira handoff business ID and local AMI credentials together.');
+  if (!username && !secret) return null;
+  if (!username || !secret || secret.length < 32 || [username, secret].some(value => /[\r\n\0]/.test(value))) {
+    throw new Error('Configure the local AMI username and secret together.');
   }
-  return {businessId, username, secret};
+  return {username, secret};
 }
 
 export function ownerHandoffReadiness(config, route, variables) {
-  if (route.mode !== 'trade' || route.did !== niraDid) return {status: 'NOT_NIRA_ROUTE'};
+  if (route.mode !== 'trade') return {status: 'NOT_TRADE_ROUTE'};
+  const extension = route.forwardingExtension;
+  if (!extension) return {status: 'NOT_MAPPED'};
+  if (!validExtension(extension)) return {status: 'INVALID_EXTENSION'};
   if (!config) return {status: 'NOT_CONFIGURED'};
-  if (route.businessId !== config.businessId) return {status: 'BUSINESS_MISMATCH'};
   if (!variables || typeof variables !== 'object') return {status: 'MISSING_CALLER_CHANNEL'};
   const channels = ['BMS_CALLER_CHANNEL', '_BMS_CALLER_CHANNEL', '__BMS_CALLER_CHANNEL']
     .filter(key => Object.hasOwn(variables, key)).map(key => variables[key]);
   if (!channels.length) return {status: 'MISSING_CALLER_CHANNEL'};
   const channel = channels[0];
   return validChannel(channel) && channels.every(value => value === channel)
-    ? {status: 'READY', channel} : {status: 'INVALID_CALLER_CHANNEL'};
+    ? {status: 'READY', channel, extension} : {status: 'INVALID_CALLER_CHANNEL'};
 }
 
-export function redirectToOwner(config, channel, connect = createConnection, onFailure = () => {}) {
-  if (!validChannel(channel)) return Promise.resolve(false);
+export function redirectToOwner(config, {channel, extension}, connect = createConnection, onFailure = () => {}) {
+  if (!validChannel(channel) || !validExtension(extension)) return Promise.resolve(false);
   return new Promise(resolve => {
     const socket = connect({host: '127.0.0.1', port: 5038});
     let buffer = '';
@@ -68,7 +69,7 @@ export function redirectToOwner(config, channel, connect = createConnection, onF
         }
         if (phase === 'redirect') return finish(true);
         phase = 'redirect';
-        socket.write(`Action: Redirect\r\nActionID: redirect\r\nChannel: ${channel}\r\nContext: bms-nira-owner-handoff\r\nExten: s\r\nPriority: 1\r\n\r\n`);
+        socket.write(`Action: Redirect\r\nActionID: redirect\r\nChannel: ${channel}\r\nContext: bms-trade-owner-handoff\r\nExten: ${extension}\r\nPriority: 1\r\n\r\n`);
       }
     });
   });

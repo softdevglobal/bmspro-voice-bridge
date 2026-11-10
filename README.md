@@ -64,24 +64,29 @@ For deployed Trade, use a reachable HTTPS gateway or an encrypted Tailscale link
 The bridge negotiates the OpenAI session. The browser sends and receives WebRTC
 audio directly with OpenAI, and the briefing tools authenticate with Trade.
 
-### Nira Electrical Lynbrook live handoff
+### Trade owner handoff
 
-The Trade voice agent can offer to transfer a caller on DID `0359111403` to
-Yeastar extension `3101`. It asks the caller first, and Asterisk rings the
-owner for 25 seconds. If the extension is unavailable, the caller hears the
-Asterisk unavailable announcement.
+Trade Super Admin can set an optional internal Yeastar extension on each DID
+mapping. Sophie asks for caller consent before transferring. The bridge
+rechecks the mapping before Asterisk rings the owner for 25 seconds. If the
+extension is unavailable, the caller hears the Asterisk unavailable announcement.
 
-1. In the live `from-yeastar` dialplan, add the `Set(__BMS_CALLER_CHANNEL=${CHANNEL})`
-   line before the WebSocket dial. Add the separate `bms-nira-owner-handoff`
-   context from `deploy/asterisk/extensions.conf.example`. Keep your existing
-   greeting and ringing priorities. Confirm the `yeastar` PJSIP endpoint can dial `3101`.
-2. Add the loopback AMI configuration from `deploy/asterisk/manager-handoff.conf.example`
+1. In Trade Super Admin, edit the existing DID mapping for Nira Electrical
+   Lynbrook (`0359111403`) and save `3101` as its forwarding extension. Save the
+   internal owner extension for any other DID that should support forwarding.
+2. In the live `from-yeastar` dialplan, ensure
+   `Set(__BMS_CALLER_CHANNEL=${CHANNEL})` runs before the WebSocket dial. Add only
+   the separate `bms-trade-owner-handoff` context from
+   `deploy/asterisk/extensions.conf.example`. Keep your existing ringing and
+   greeting priorities. Keep the new context private and allow the Yeastar
+   account used by Asterisk to call internal destinations only.
+3. Add the loopback AMI configuration from `deploy/asterisk/manager-handoff.conf.example`
    to your existing `manager.conf` and set a strong random secret.
-3. In the bridge environment, set `BMSPRO_NIRA_HANDOFF_BUSINESS_ID` to the Trade
-   business ID for Nira Electrical Lynbrook, `BMSPRO_HANDOFF_AMI_USER=bms-owner-handoff`,
-   and `BMSPRO_HANDOFF_AMI_SECRET` to the matching AMI secret.
-4. Reload the Asterisk manager and dialplan, restart the bridge, then call the
-   Trade number and ask for the owner. Test both an answered and unanswered transfer.
+4. The bridge uses `BMSPRO_HANDOFF_AMI_USER=bms-owner-handoff` and
+   `BMSPRO_HANDOFF_AMI_SECRET` matching the existing AMI account. The old
+   `BMSPRO_NIRA_HANDOFF_BUSINESS_ID` setting can be removed.
+5. Reload the dialplan, restart the updated bridge, and test transfers on two
+   mapped DIDs, including an unanswered transfer.
 
 ### Dialog manager
 

@@ -120,6 +120,29 @@ test('Trade startup rejects a mismatched discovery business or Black profile', a
   try { await assert.rejects(openTradeSession(invalid.config)); } finally { await invalid.close(); }
 });
 
+test('Trade uses the discovery profile without a second profile request and still rejects a remapped DID', async () => {
+  const f = await fixture();
+  let session;
+  try {
+    const routes = loadTenantRoutes({
+      BMSPRO_BRIDGE_SECRET: 'test-command-center-secret-0000000000000',
+      BMSPRO_TRADE_MCP_URL: f.config.url.replace(/\/mcp$/, '/api/ai/mcp'),
+      BMSPRO_TRADE_BRIDGE_SECRET: secret,
+      BMSPRO_ALLOW_HTTP_FOR_LOCAL_TEST: 'true',
+    });
+    const config = await resolveConfigForDid(f.config.did, routes, async () => Response.json({
+      matched: true, brand: 'trade', did: f.config.did, businessId: 'business-a',
+      profile: {businessName: 'Trade A', timezone: 'Australia/Melbourne'},
+    }));
+    session = await openTradeSession(config);
+    assert.equal(session.config.businessName, 'Trade A');
+    assert.equal(f.calls.length, 0);
+    assert.ok(f.bindings.length > 0 && f.bindings.every(id => id === 'business-a'));
+    f.remap();
+    await assert.rejects(openTradeSession(config));
+  } finally { await session?.close(); await f.close(); }
+});
+
 test('job tools reach the model without retry keys or job-change contacts, and cancel uses the verified lookup', async () => {
   const f = await fixture({actions: true, jobs: true}); let session;
   try {
