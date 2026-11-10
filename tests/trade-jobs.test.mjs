@@ -64,6 +64,22 @@ test('job changes require a matching lookup in this call and reuse its verified 
   assert.equal((await policy.call('cancel_job', {customerConfirmed: true, jobCode: code})).status, 'LOOKUP_REQUIRED');
 });
 
+test('prepared job retains optional finish and owner deferral through caller confirmation', async () => {
+  const {policy, writes} = fixture();
+  await policy.call('list_services', {});
+  await checked(policy);
+  const args = {serviceId: 'service-a', customer, address: site, deferScheduling: true};
+  assert.equal((await policy.prepare({...args, preferredSlots: [{...slot, endTime: '09:30'}]}, 'create_job_booking')).status, 'REJECTED');
+  const preference = {...slot, endTime: '13:00'};
+  const prepared = await policy.prepare({...args, preferredSlots: [preference]}, 'create_job_booking');
+  assert.equal(prepared.status, 'READY_FOR_CONFIRMATION');
+  assert.deepEqual(prepared.summary.preferredSlots, [preference]);
+  assert.equal(writes().length, 0);
+  await policy.submit({customerConfirmed: true}, 'create_job_booking');
+  assert.deepEqual(writes()[0].args.preferredSlots, [preference]);
+  assert.equal(writes()[0].args.deferScheduling, true);
+});
+
 test('team-only jobs cannot be changed and rejected moves may be retried with a new key', async () => {
   const locked = fixture({canChange: false});
   await locked.policy.call('find_job', {jobCode: code, ...contact});

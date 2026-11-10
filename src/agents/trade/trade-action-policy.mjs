@@ -28,13 +28,16 @@ function jobCode(value) {
   if (compact.length === 11 && compact.startsWith('BK')) compact = compact.slice(2);
   return /^[2-9A-HJKMNP-Z]{9}$/.test(compact) ? `BK ${compact}` : null;
 }
-/** One to three distinct sessions; jobs may add an exact HH:MM start time. */
-function sessions(value, allowStart) {
+/** One to three distinct sessions with optional HH:MM preferences. */
+function sessions(value, allowStart, allowEnd = false) {
   const keys = allowStart ? ['date', 'timeRange', 'startTime'] : ['date', 'timeRange'];
+  if (allowEnd) keys.push('endTime');
   if (!Array.isArray(value) || !value.length || value.length > 3 || value.some(slot => !only(slot, keys) || !date(slot.date) ||
-      !['morning', 'afternoon'].includes(slot.timeRange) || (slot.startTime != null && !clock(slot.startTime)))) return null;
+      !['morning', 'afternoon'].includes(slot.timeRange) || (slot.startTime != null && !clock(slot.startTime)) ||
+      (slot.endTime != null && (!clock(slot.endTime) || (slot.startTime && slot.endTime <= slot.startTime))))) return null;
   if (new Set(value.map(slot => `${slot.date}:${slot.timeRange}`)).size !== value.length) return null;
-  return value.map(slot => allowStart ? {date: slot.date, timeRange: slot.timeRange, startTime: slot.startTime ?? null} : {date: slot.date, timeRange: slot.timeRange});
+  return value.map(slot => allowStart ? {date: slot.date, timeRange: slot.timeRange, startTime: slot.startTime ?? null,
+    ...(allowEnd && slot.endTime ? {endTime: slot.endTime} : {})} : {date: slot.date, timeRange: slot.timeRange});
 }
 function address(value) {
   if (!only(value, ['street', 'suburb', 'state', 'postcode']) || typeof value.street !== 'string' || value.street.length > 300 ||
@@ -124,17 +127,19 @@ export function createTradeActionPolicy(inventory, remote) {
           if (!only(raw, ['customerConfirmed', 'customer'])) return rejected('Use only the advertised customer registration fields.');
           args = {customerConfirmed: true, customer};
         } else if (name === 'create_job_booking') {
-          if (!only(raw, ['customerConfirmed', 'serviceId', 'customerId', 'customer', 'address', 'preferredSlots', 'customerNotes']))
+          if (!only(raw, ['customerConfirmed', 'serviceId', 'customerId', 'customer', 'address', 'preferredSlots', 'customerNotes', 'deferScheduling']) ||
+              (raw.deferScheduling !== undefined && typeof raw.deferScheduling !== 'boolean'))
             return rejected('Use only the advertised job booking fields.');
           if (!services.has(raw.serviceId)) return rejected('List services in this call and choose a returned service. Jobs book existing services only; offer an inspection for advice.');
-          const site = address(raw.address), slots = sessions(raw.preferredSlots, true);
+          const site = address(raw.address), slots = sessions(raw.preferredSlots, true, true);
           if (!site) return rejected('Collect and read back the job address, suburb, state and four-digit postcode.');
-          if (!slots) return rejected('Choose one to three distinct dates with morning/afternoon and an optional exact HH:MM start time.');
+          if (!slots) return rejected('Choose one to three distinct preferred sessions. Start and finish are optional HH:MM values, and finish must be after start.');
           const customerId = raw.customerId ?? null, customerNotes = raw.customerNotes ?? '';
           if (customerId !== null && (!id(customerId) || customers.get(customerId) !== contactKey(customer))) return rejected('Use a customer reference returned for these same contact details in this call, or null for a guest.');
           if (typeof customerNotes !== 'string' || customerNotes.length > 2000) return rejected('Keep job notes under 2000 characters.');
-          if (unchecked(slots)) return {status: 'AVAILABILITY_REQUIRED', message: 'Successfully check availability for every preferred date and choose sessions that are not unavailable.'};
-          args = {customerConfirmed: true, serviceId: raw.serviceId, customerId, customer, address: site, preferredSlots: slots, customerNotes: customerNotes.trim()};
+          if (!raw.deferScheduling && unchecked(slots)) return {status: 'AVAILABILITY_REQUIRED', message: 'Successfully check availability for every preferred date and choose sessions that are not unavailable.'};
+          args = {customerConfirmed: true, serviceId: raw.serviceId, customerId, customer, address: site, preferredSlots: slots,
+            customerNotes: customerNotes.trim(), ...(raw.deferScheduling ? {deferScheduling: true} : {})};
         } else {
           if (!only(raw, ['customerConfirmed', 'requestType', 'serviceId', 'customRequest', 'customerId', 'customer', 'address', 'preferredSlots', 'budgetAud', 'customerNotes']))
             return rejected('Use only the advertised inspection fields.');
