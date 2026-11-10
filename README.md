@@ -49,6 +49,40 @@ Then run `npm ci` if dependencies changed and restart the bridge as before
 (`node --env-file=.env bridge.mjs` still works). In old commands, `check-mcp.mjs` is now
 `scripts/check-mcp.mjs` and the Asterisk examples are in `deploy/asterisk/`.
 
+### Trade dashboard voice
+
+Enable `BMSPRO_OWNER_VOICE_ENABLED=true` on the bridge. It uses the existing
+`OPENAI_API_KEY` and `BMSPRO_TRADE_BRIDGE_SECRET`. The Trade server needs
+`AI_VOICE_BRIDGE_SECRET` set to that same Trade bridge secret and
+`AI_OWNER_VOICE_BRIDGE_URL` set to the origin that reaches the bridge listener.
+
+For local Trade development, forward a port to the existing loopback listener
+with `ssh -NT -o ExitOnForwardFailure=yes -L 127.0.0.1:18787:127.0.0.1:8787 dev@100.88.220.83`
+and set `AI_OWNER_VOICE_BRIDGE_URL=http://127.0.0.1:18787` in Trade.
+For deployed Trade, use a reachable HTTPS gateway or an encrypted Tailscale link.
+
+The bridge negotiates the OpenAI session. The browser sends and receives WebRTC
+audio directly with OpenAI, and the briefing tools authenticate with Trade.
+
+### Nira Electrical Lynbrook live handoff
+
+The Trade voice agent can offer to transfer a caller on DID `0359111403` to
+Yeastar extension `3101`. It asks the caller first, and Asterisk rings the
+owner for 25 seconds. If the extension is unavailable, the caller hears the
+Asterisk unavailable announcement.
+
+1. In the live `from-yeastar` dialplan, add the `Set(__BMS_CALLER_CHANNEL=${CHANNEL})`
+   line before the WebSocket dial. Add the separate `bms-nira-owner-handoff`
+   context from `deploy/asterisk/extensions.conf.example`. Keep your existing
+   greeting and ringing priorities. Confirm the `yeastar` PJSIP endpoint can dial `3101`.
+2. Add the loopback AMI configuration from `deploy/asterisk/manager-handoff.conf.example`
+   to your existing `manager.conf` and set a strong random secret.
+3. In the bridge environment, set `BMSPRO_NIRA_HANDOFF_BUSINESS_ID` to the Trade
+   business ID for Nira Electrical Lynbrook, `BMSPRO_HANDOFF_AMI_USER=bms-owner-handoff`,
+   and `BMSPRO_HANDOFF_AMI_SECRET` to the matching AMI secret.
+4. Reload the Asterisk manager and dialplan, restart the bridge, then call the
+   Trade number and ask for the owner. Test both an answered and unanswered transfer.
+
 ### Dialog manager
 
 `src/dialog/dialog-manager.mjs` keeps per-call conversation state for every mode

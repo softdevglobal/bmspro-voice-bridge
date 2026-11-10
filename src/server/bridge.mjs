@@ -11,6 +11,8 @@ import {createInputAudioClock, createPacedAudioTimer} from '../audio/input-audio
 import {createDraftTypingCue, pcmuHasSpeech} from '../audio/draft-typing.mjs'; // typing sound 
 import {createVoiceStudioShadow} from '../asr/voice-studio-shadow.mjs'; // side by side seech to text test
 import {createCallTranscript} from '../observability/call-transcript.mjs'; // per-call transcript file writer
+import {createOwnerVoiceHandler} from './owner-voice.mjs';
+import {loadOwnerHandoff, ownerHandoffReadiness, redirectToOwner} from './owner-handoff.mjs';
 
 // Independent tenant and tool state per call; no application duration cutoff.
 // Refuse to start without the OpenAI Api key.
@@ -24,6 +26,7 @@ try {
   process.exit(1);
 }
 const client = new OpenAI(); // shared OpenAI client (reads OPENAI_API_KEY)
+const ownerHandoff = loadOwnerHandoff();
 const dialogMode = dialogModeFromEnv(); // BMSPRO_DIALOG_MANAGER: on (default), observe or off
 console.log(`Dialog manager: ${dialogMode}.`);
 console.log('Audio pacing follows elapsed time; bounded catch-up enabled.');
@@ -64,8 +67,19 @@ if (!bindIsLoopback && !bindIsTailscale) throw new Error('BMSPRO_BIND_HOST must 
 const activeCalls = new Set();
 const stopCalls = new Map();
 let shuttingDown = false;
-// ---- HTTP server: only /health is served, everything else is 404 ----
+const ownerVoice = process.env.BMSPRO_OWNER_VOICE_ENABLED === 'true' && tenantRoutes.directTrade
+  ? createOwnerVoiceHandler({
+      secret: tenantRoutes.directTrade.token,
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_REALTIME_MODEL?.trim() || undefined,
+    })
+  : null;
+// ---- HTTP server for health checks and authenticated owner voice setup ----
 const server = http.createServer((req, res) => {
+  if (req.url === '/owner-voice/session' && ownerVoice && !shuttingDown) {
+    void ownerVoice(req, res);
+    return;
+  }
   res.writeHead(req.url === '/health' ? 200 : 404, {'Content-Type': 'application/json'});
   res.end(JSON.stringify(req.url === '/health' ? {status: 'listening', activeCalls: activeCalls.size, maxCalls, routing: 'backend-did-mappings'} : {error: 'not found'}));
 });
@@ -100,7 +114,7 @@ wss.on('connection', media => {
     .replace(/\b(?:sk|sess|re)_[A-Za-z0-9_-]{12,}\b/g, '[redacted-token]')
     .replace(/[^\x20-\x7E]/g, '?').slice(0, 240);
   let live, businessSession, businessConfig, voiceStudioShadow, connecting = false, ready = false, closing = false, paused = false, released = false;
-  let activityConfig, activityStartedAt;
+  let activityConfig, activityStartedAt, callerChannel, handoffAttempted = false;
   let dialog = null; // per-call dialog manager, created once the agent session is open
   let toolQueue = Promise.resolve();
   const handledCalls = new Set();
@@ -179,7 +193,7 @@ wss.on('connection', media => {
     void transcript?.close(endReason);
   };
     // End the call for any reason (hangup, error, timeout, shutdown). Safe to call repeatedly.
-  const finish = reason => {
+  const finish = (reason, hangupMedia = true) => {
     if (closing) return;
     closing = true;
     endReason = reason;
@@ -197,7 +211,7 @@ wss.on('connection', media => {
       const state = dialog.snapshot();
       log(`Dialog final: step=${state.step} completed=${state.completed.join(',') || 'none'} toolCalls=${state.toolCalls}`);
     }
-    if (media.readyState === 1) { command('HANGUP'); media.close(); }
+    if (hangupMedia && media.readyState === 1) { command('HANGUP'); media.close(); }
     if (live?.socket.readyState === 1 && ready) {
       live.send({type: 'session.close'});
       finalTimer = setTimeout(() => {
@@ -237,7 +251,21 @@ wss.on('connection', media => {
         const args = JSON.parse(item.arguments);
         // Dialog manager: block a write whose earlier steps are not done yet.
         const blocked = dialog?.check(item.name) ?? null;
-        if (blocked) result = blocked;
+        if (item.name === 'transfer_to_owner') {
+          if (!callerChannel || answeredAt === undefined || handoffAttempted ||
+              !args || Object.keys(args).length !== 1 || args.callerConfirmed !== true) {
+            log(`Owner handoff failed: ${handoffAttempted ? 'ALREADY_ATTEMPTED' : answeredAt === undefined ? 'CALL_NOT_ANSWERED' : 'CONFIRMATION_REQUIRED'}`);
+            result = {status: 'UNAVAILABLE', message: 'The transfer was not started.'};
+          } else {
+            handoffAttempted = true;
+            draftTyping.stop();
+            if (await redirectToOwner(ownerHandoff, callerChannel, undefined, reason => log(`Owner handoff failed: ${reason}`))) {
+              log('Owner handoff accepted by Asterisk.');
+              return finish('owner handoff', false);
+            }
+            result = {status: 'UNAVAILABLE', message: 'The owner transfer could not be started. Explain that you could not connect them.'};
+          }
+        } else if (blocked) result = blocked;
         else {
           draftTyping.start();
           result = await businessSession.call(item.name, args);
@@ -377,6 +405,20 @@ wss.on('connection', media => {
       backendReadyAt = performance.now();
       log(`MCP ready: setupMs=${Math.round(backendReadyAt - setupStartedAt)}`);
       businessConfig = businessSession.config;
+      const handoff = ownerHandoffReadiness(ownerHandoff, businessConfig, event.channel_variables);
+      callerChannel = handoff.channel;
+      if (handoff.status !== 'NOT_NIRA_ROUTE') log(`Owner handoff: ${handoff.status}`);
+      if (callerChannel) {
+        businessSession.tools.push({
+          type: 'function', name: 'transfer_to_owner', strict: false,
+          description: 'Transfer the live caller to the business owner. Offer when the caller asks for a human or you cannot help. Wait for a clear yes, say you will put them through, then call once.',
+          parameters: {type: 'object', properties: {callerConfirmed: {type: 'boolean', const: true}},
+            required: ['callerConfirmed'], additionalProperties: false},
+        });
+        const handoffInstructions = ' For this call, transfer_to_owner is available. If the caller asks for a person or you cannot help, offer to connect them to the owner. Wait for a clear yes, tell them you will put them through, then call transfer_to_owner once. If it fails, explain that you could not connect them.';
+        businessSession.voiceInstructions = businessSession.voiceInstructions.replace(' or transfer actions', '') + handoffInstructions;
+        businessSession.backendInstructions += handoffInstructions;
+      }
       if (dialogMode !== 'off') dialog = createDialogManager({mode: businessConfig.mode, enforce: dialogMode === 'on', log});
       transcript?.metadata({did: businessConfig.did, mode: businessConfig.mode,
         businessName: businessConfig.businessName || businessConfig.workshop, businessId: businessConfig.businessId || businessSession.profile?.businessId});

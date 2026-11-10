@@ -3,7 +3,18 @@
 [from-yeastar]
 exten => 2000,1,Set(__BMS_ROUTE_INFO=${PJSIP_HEADER(read,Alert-Info)})
  same => n,GotoIf($[${LEN(${BMS_ROUTE_INFO})}=0]?reject)
+ same => n,Set(__BMS_CALLER_CHANNEL=${CHANNEL})
  same => n,Ringing()
  same => n,Dial(WebSocket/bmspro-media/c(ulaw)f(json)n,65,r)
  same => n,Hangup()
+ same => n(reject),Hangup(21)
+
+; AMI redirects the original Nira caller here after they agree to transfer.
+; Keep this context out of any public/inbound include list.
+[bms-nira-owner-handoff]
+exten => s,1,GotoIf($[${REGEX("info=bmsdid0359111403[ ]*$" ${BMS_ROUTE_INFO})}=0]?reject)
+ same => n,Dial(PJSIP/3101@yeastar,25,r)
+ same => n,GotoIf($["${DIALSTATUS}"="ANSWER"]?done)
+ same => n,Playback(vm-nobodyavail)
+ same => n(done),Hangup()
  same => n(reject),Hangup(21)
