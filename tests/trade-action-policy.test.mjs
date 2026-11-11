@@ -142,3 +142,31 @@ test('knowledge search is allowed only when advertised, sends only the question 
     assert.equal((await policy.call('search_business_knowledge', {question: 'Is there a fee?'})).status, 'UNAVAILABLE');
   }
 });
+
+test('a repeated knowledge question in one call is answered from this call without another Trade request', async () => {
+  let requests = 0, reply = {status: 'FOUND', passages: [{title: 'Call-out fee', text: '$90 in our area.'}], message: 'data'};
+  const policy = createTradeActionPolicy(new Map([...names, 'search_business_knowledge'].map(name => [name, {}])), async () => { requests++; return reply; });
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Is there a call-out fee?'})).status, 'FOUND');
+  const again = await policy.call('search_business_knowledge', {question: 'is there a call out fee'});
+  assert.equal(again.status, 'FOUND');
+  assert.equal(again.passages[0].text, '$90 in our area.');
+  assert.equal(requests, 1);
+  again.passages[0].text = 'changed by caller code';
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Is there a call-out fee?'})).passages[0].text, '$90 in our area.');
+
+  // Failures are not remembered, so the next ask tries Trade again.
+  reply = null;
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Do you work Sundays?'})).status, 'UNAVAILABLE');
+  reply = {status: 'NO_MATCH', passages: [], message: 'none'};
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Do you work Sundays?'})).status, 'NO_MATCH');
+  assert.equal(requests, 3);
+});
+
+test('Trade tool timeouts: knowledge fails fast, other reads in 20 s, writes keep 40 s', async () => {
+  const {toolTimeoutMs} = await import('../src/agents/trade/trade-tools.mjs');
+  assert.equal(toolTimeoutMs('search_business_knowledge'), 12000);
+  assert.equal(toolTimeoutMs('get_available_slots'), 20000);
+  assert.equal(toolTimeoutMs('list_services'), 20000);
+  for (const name of ['create_inspection_request', 'create_job_booking', 'register_customer', 'reschedule_job', 'cancel_job'])
+    assert.equal(toolTimeoutMs(name), 40000);
+});

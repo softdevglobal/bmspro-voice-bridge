@@ -47,6 +47,9 @@ export function createTradeActionPolicy(inventory, remote) {
   const services = new Set(), customers = new Map(), checks = [], writes = new Map(), jobs = new Map();
   // Prepared details per submission tool (inspection or job), held only in this call.
   const prepared = new Map();
+  // Knowledge answers already fetched in this call, so a repeated question answers instantly.
+  const knowledge = new Map();
+  const knowledgeKey = question => question.toLowerCase().replace(/[^\p{L}\p{N}$%]+/gu, ' ').trim();
   const names = [...baseTools, ...['find_customer', 'get_available_slots'].filter(name => inventory.has(name))];
   if (inventory.has('find_customer') && inventory.has('register_customer')) names.push('register_customer');
   if (inventory.has('find_customer') && inventory.has('get_available_slots') && inventory.has('create_inspection_request')) names.push('create_inspection_request');
@@ -115,6 +118,8 @@ export function createTradeActionPolicy(inventory, remote) {
         if (!only(raw, ['question']) || question.length < 3 || question.length > 300)
           return rejected('Ask one short question about this business, without customer names, emails or phone numbers.');
         args = {question};
+        const known = knowledge.get(knowledgeKey(question));
+        if (known) return structuredClone(known);
       } else {
         if (raw.customerConfirmed !== true) return {status: 'CONFIRMATION_REQUIRED', message: 'Read back the details and obtain explicit confirmation before this action.'};
         const customer = contact(raw.customer, true);
@@ -234,6 +239,10 @@ export function createTradeActionPolicy(inventory, remote) {
               result.passages.some(passage => typeof passage?.title !== 'string' || typeof passage.text !== 'string' || passage.text.length > 2000))
             throw new Error('Invalid knowledge result.');
           if (result.status === 'FOUND' && !result.passages.length) throw new Error('Invalid knowledge result.');
+          if (['FOUND', 'NO_MATCH'].includes(result.status)) {
+            if (knowledge.size >= 30) knowledge.delete(knowledge.keys().next().value);
+            knowledge.set(knowledgeKey(args.question), structuredClone(result));
+          }
         }
         return result;
       } catch {

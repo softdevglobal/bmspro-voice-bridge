@@ -68,6 +68,24 @@ if (!Number.isInteger(playbackLeadMs) || playbackLeadMs < 0 || playbackLeadMs > 
 const playbackLeadFrames = Math.round(playbackLeadMs / 20);
 // Barge-in is on unless explicitly disabled (BMSPRO_BARGE_IN=false).
 const bargeInEnabled = process.env.BMSPRO_BARGE_IN !== 'false';
+// Backend (delegated) model speed. It runs twice for each lookup: once to choose the
+// tool and once to write the answer, so its reasoning time is most of the pause
+// after "let me check". "default" leaves the setting to OpenAI's model default.
+const choice = (name, fallback, allowed) => {
+  const value = (process.env[name]?.trim() || fallback).toLowerCase();
+  if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(', ')}.`);
+  return value;
+};
+const backendReasoningEffort = choice('BMSPRO_BACKEND_REASONING_EFFORT', 'low', ['default', 'none', 'minimal', 'low', 'medium', 'high']);
+const backendVerbosity = choice('BMSPRO_BACKEND_VERBOSITY', 'low', ['default', 'low', 'medium', 'high']);
+// 'priority' is faster at a higher price; see OpenAI's pricing before enabling.
+const backendServiceTier = choice('BMSPRO_BACKEND_SERVICE_TIER', 'default', ['default', 'auto', 'priority']);
+const backendSpeedSettings = {
+  ...(backendReasoningEffort !== 'default' ? {reasoning: {effort: backendReasoningEffort}} : {}),
+  ...(backendVerbosity !== 'default' ? {text: {verbosity: backendVerbosity}} : {}),
+  ...(backendServiceTier !== 'default' ? {service_tier: backendServiceTier} : {}),
+};
+console.log(`Backend model speed: reasoning=${backendReasoningEffort} verbosity=${backendVerbosity} serviceTier=${backendServiceTier}`);
 const bindHost = process.env.BMSPRO_BIND_HOST?.trim() || '127.0.0.1'; // address to bind
 const bindOctets = bindHost.split('.').map(Number); 
 const bindIsLoopback = bindHost === '127.0.0.1' || bindHost === '::1';
@@ -470,6 +488,7 @@ wss.on('connection', media => {
           audio: {format: {type: 'audio/pcmu', rate: 8000}, output: {voice: 'shimmer'}},
           delegation: {type: 'responses', responses: {
             model: 'gpt-6-luna', tools: [...businessSession.tools, END_CALL_TOOL], parallel_tool_calls: false,
+            ...backendSpeedSettings,
             instructions: [businessSession.backendInstructions ?? backendInstructions(businessConfig), END_CALL_BACKEND_RULE, businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : ''].join(' ')
           }}
         }});

@@ -177,6 +177,9 @@ Call **0359111403**.
 | `BMSPRO_PLAYBACK_LEAD_MS` | `240` | Audio cushion kept in Asterisk to hide tunnel jitter. **Laptop only; use 0 on the server.** |
 | `BMSPRO_BARGE_IN` | (unset = on) | Sophie stops when the caller talks; `false` turns it off |
 | `BMSPRO_TRANSCRIPTS_ENABLED` | `true` | Writes transcript files |
+| `BMSPRO_BACKEND_REASONING_EFFORT` | (unset = `low`) | How long the backend model thinks before each lookup and answer. Lower is faster. `medium`/`high` if bookings go wrong; `default` = OpenAI's default |
+| `BMSPRO_BACKEND_VERBOSITY` | (unset = `low`) | Keeps backend answers short. `default` = OpenAI's default |
+| `BMSPRO_BACKEND_SERVICE_TIER` | (unset = `default`) | `priority` is faster but costs more per token |
 
 **Trade** (`.env.local`)
 
