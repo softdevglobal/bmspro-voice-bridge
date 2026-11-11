@@ -39,3 +39,32 @@ test('owner voice setup requires the Trade bridge secret and uses the bridge Ope
   assert.equal(await response.text(), 'v=0\r\no=answer');
   assert.equal(upstream.mock.callCount(), 1);
 });
+
+test('owner voice accepts any known read-only tools, but not unknown or repeated ones', async (t) => {
+  const secret = 'trade-bridge-test-secret-0000000000000000';
+  const upstream = t.mock.fn(async () => new Response('v=0\r\no=answer'));
+  const server = createServer(createOwnerVoiceHandler({secret, apiKey: 'key', fetcher: upstream}));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}/owner-voice/session`;
+  const start = names => fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', Authorization: `Bearer ${secret}`},
+    body: JSON.stringify({
+      sdp: 'v=0\r\no=fixture', safetyIdentifier: 'b'.repeat(64),
+      session: {instructions: 'Owner briefing.', tools: names.map(name => ({type: 'function', name}))},
+    }),
+  });
+
+  // New Trade server (5 tools) and an older one (3 tools) both work.
+  assert.equal((await start(['get_daily_summary', 'get_day_activity', 'get_staff_day_report',
+    'list_jobs_awaiting_scheduling', 'get_staff_working_today'])).status, 200);
+  assert.equal((await start(['get_daily_summary', 'list_jobs_awaiting_scheduling',
+    'get_staff_working_today'])).status, 200);
+  assert.equal(upstream.mock.callCount(), 2);
+
+  assert.equal((await start(['get_daily_summary', 'create_job'])).status, 400, 'unknown tool');
+  assert.equal((await start(['get_daily_summary', 'get_daily_summary'])).status, 400, 'repeated tool');
+  assert.equal((await start([])).status, 400, 'no tools');
+  assert.equal(upstream.mock.callCount(), 2);
+});
