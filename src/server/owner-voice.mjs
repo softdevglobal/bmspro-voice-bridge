@@ -1,10 +1,21 @@
 import {timingSafeEqual} from 'node:crypto';
 
+// Read-only owner tools the Trade server may offer. The Trade server can send
+// any of them (so the bridge and Trade can be deployed in either order), but
+// never an unknown or repeated tool.
 const toolNames = new Set([
   'get_daily_summary',
+  'get_day_activity',
+  'get_staff_day_report',
   'list_jobs_awaiting_scheduling',
   'get_staff_working_today',
 ]);
+
+function validTools(tools) {
+  return Array.isArray(tools) && tools.length > 0 && tools.length <= toolNames.size &&
+    new Set(tools.map(tool => tool?.name)).size === tools.length &&
+    tools.every(tool => tool?.type === 'function' && toolNames.has(tool.name));
+}
 
 function authorized(header, secret) {
   if (!secret || secret.length < 32) return false;
@@ -44,9 +55,7 @@ export function createOwnerVoiceHandler({secret, apiKey, model = 'gpt-realtime-2
       if (typeof sdp !== 'string' || !/^v=0\r?\n/.test(sdp) || Buffer.byteLength(sdp) > 64 * 1024 ||
           typeof safetyIdentifier !== 'string' || !/^[a-f0-9]{64}$/.test(safetyIdentifier) ||
           typeof session?.instructions !== 'string' || session.instructions.length > 4000 ||
-          !Array.isArray(session.tools) || session.tools.length !== toolNames.size ||
-          new Set(session.tools.map(tool => tool?.name)).size !== toolNames.size ||
-          session.tools.some(tool => tool?.type !== 'function' || !toolNames.has(tool.name))) {
+          !validTools(session.tools)) {
         return fail(400);
       }
 
