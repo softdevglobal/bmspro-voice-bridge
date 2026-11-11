@@ -118,14 +118,16 @@ test('unknown modes are a no-op and the env setting is validated', () => {
   assert.throws(() => dialogModeFromEnv({BMSPRO_DIALOG_MANAGER: 'maybe'}));
 });
 
-test('greetings match the previous bridge wording for every mode', () => {
+test('Trade offers both intake paths when enabled and keeps the other mode greetings', () => {
   const tail = ' Pronounce Sophie as SOH-fee. Then pause and listen. Do not call a tool before greeting.';
   const head = 'Speak this greeting in English, preserving the complete sentence "My name is Sophie": ';
   assert.equal(openingGreeting({mode: 'onboarding'}),
     `${head}"Hi, thanks for calling BMS Pro. My name is Sophie, your AI assistant. Shall we get your business set up?"${tail}`);
   assert.equal(openingGreeting({mode: 'pink', businessName: 'Glow', branch: 'City'}),
     `${head}"Hello, thank you for calling "Glow", "City". My name is Sophie, your AI receptionist. How can I help?"${tail}`);
-  assert.equal(openingGreeting({mode: 'trade', businessName: 'Roofs'}),
+  assert.equal(openingGreeting({mode: 'trade', businessName: 'Roofs', canBookJobs: true, canRequestInspection: true}),
+    `${head}"Hi, thanks for calling "Roofs". My name is Sophie, your AI receptionist. Would you like to request an inspection or book a job directly?"${tail}`);
+  assert.equal(openingGreeting({mode: 'trade', businessName: 'Roofs', canRequestInspection: true}),
     `${head}"Hi, thanks for calling "Roofs". My name is Sophie, your AI receptionist. Would you like an existing service, or do you need advice?"${tail}`);
   assert.equal(openingGreeting({mode: 'receptionist', workshop: 'Niranga', branch: 'Dambulla'}),
     `${head}"Hello, thank you for calling "Niranga", "Dambulla". My name is Sophie, your AI receptionist. How can I help?"${tail}`);

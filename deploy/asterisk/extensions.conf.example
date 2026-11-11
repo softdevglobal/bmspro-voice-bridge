@@ -3,7 +3,19 @@
 [from-yeastar]
 exten => 2000,1,Set(__BMS_ROUTE_INFO=${PJSIP_HEADER(read,Alert-Info)})
  same => n,GotoIf($[${LEN(${BMS_ROUTE_INFO})}=0]?reject)
+ same => n,Set(__BMS_CALLER_CHANNEL=${CHANNEL})
  same => n,Ringing()
  same => n,Dial(WebSocket/bmspro-media/c(ulaw)f(json)n,65,r)
  same => n,Hangup()
+ same => n(reject),Hangup(21)
+
+; AMI redirects the original caller here with the saved Trade extension.
+; Keep this context out of any public/inbound include list.
+[bms-trade-owner-handoff]
+exten => _X.,1,GotoIf($["${CHANNEL}" != "${BMS_CALLER_CHANNEL}"]?reject)
+ same => n,GotoIf($[${REGEX("^[0-9]{2,11}$" ${EXTEN})}=0 | "${EXTEN}"="2000"]?reject)
+ same => n,Dial(PJSIP/${EXTEN}@yeastar,25,r)
+ same => n,GotoIf($["${DIALSTATUS}"="ANSWER"]?done)
+ same => n,Playback(vm-nobodyavail)
+ same => n(done),Hangup()
  same => n(reject),Hangup(21)

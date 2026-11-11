@@ -163,8 +163,15 @@ export async function resolveConfigForDid(did, routes, fetcher = fetch) {
         if (route.brand !== 'trade' || typeof route.businessId !== 'string' || !route.businessId.trim() || route.businessId !== route.businessId.trim() ||
             route.businessId.length > 128 || route.businessId.includes('/') || ['.', '..'].includes(route.businessId))
           throw new Error('Trade DID discovery returned an invalid business.');
+        // Profile from discovery lets Sophie greet before the tool session is ready.
+        const profile = route.profile && {
+          brand: 'trade', did, businessId: route.businessId,
+          businessName: route.profile.businessName, timezone: route.profile.timezone,
+        };
         // Return the direct Trade config pinned to this business. The shared backend (activityUrl/Token) is used for activity records.
         return {mode: 'trade', url: routes.directTrade.url, token: routes.directTrade.token, did, businessId: route.businessId,
+          ...(typeof route.forwardingExtension === 'string' && {forwardingExtension: route.forwardingExtension}),
+          ...(profile && {discoveredProfile: profile}),
           activityUrl: routes.config.url, activityToken: routes.config.token, routingHeaders: {'X-BMSPro-DID': did, 'X-BMSPro-Trade-Business': route.businessId}};
       }
     // Any other HTTP error from Trade: remember it for the error message.

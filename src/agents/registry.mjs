@@ -2,7 +2,7 @@
 // Each agent opens a call-scoped backend (MCP) session and has a fixed greeting.
 import {openBusinessSession} from './black/business-tools.mjs';
 import {openOnboardingSession} from './onboarding/onboarding-tools.mjs';
-import {openTradeSession} from './trade/trade-tools.mjs';
+import {openTradeSession, tradeOpeningQuestion} from './trade/trade-tools.mjs';
 import {openPinkSession} from './pink/pink-tools.mjs';
 
 // Modes come from tenant-routing.mjs. Black uses 'receptionist'.
@@ -26,6 +26,6 @@ export function openingGreeting(config) {
   if (config.mode === 'pink')
     return speak(`Hello, thank you for calling ${JSON.stringify(config.businessName)}, ${JSON.stringify(config.branch)}. My name is Sophie, your AI receptionist. How can I help?`);
   if (config.mode === 'trade')
-    return speak(`Hi, thanks for calling ${JSON.stringify(config.businessName)}. My name is Sophie, your AI receptionist. Would you like an existing service, or do you need advice?`);
+    return speak(`Hi, thanks for calling ${JSON.stringify(config.businessName)}. My name is Sophie, your AI receptionist. ${tradeOpeningQuestion(config)}`);
   return speak(`Hello, thank you for calling ${JSON.stringify(config.workshop)}, ${JSON.stringify(config.branch)}. My name is Sophie, your AI receptionist. How can I help?`);
 }

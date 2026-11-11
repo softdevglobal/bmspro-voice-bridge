@@ -1,0 +1,12 @@
+; Merge these settings into the existing manager.conf. Keep AMI on loopback.
+[general]
+enabled = yes
+port = 5038
+bindaddr = 127.0.0.1
+
+[bms-owner-handoff]
+secret = REPLACE_WITH_A_STRONG_RANDOM_SECRET
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
+read = none
+write = call

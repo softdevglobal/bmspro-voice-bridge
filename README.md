@@ -49,6 +49,45 @@ Then run `npm ci` if dependencies changed and restart the bridge as before
 (`node --env-file=.env bridge.mjs` still works). In old commands, `check-mcp.mjs` is now
 `scripts/check-mcp.mjs` and the Asterisk examples are in `deploy/asterisk/`.
 
+### Trade dashboard voice
+
+Enable `BMSPRO_OWNER_VOICE_ENABLED=true` on the bridge. It uses the existing
+`OPENAI_API_KEY` and `BMSPRO_TRADE_BRIDGE_SECRET`. The Trade server needs
+`AI_VOICE_BRIDGE_SECRET` set to that same Trade bridge secret and
+`AI_OWNER_VOICE_BRIDGE_URL` set to the origin that reaches the bridge listener.
+
+For local Trade development, forward a port to the existing loopback listener
+with `ssh -NT -o ExitOnForwardFailure=yes -L 127.0.0.1:18787:127.0.0.1:8787 dev@100.88.220.83`
+and set `AI_OWNER_VOICE_BRIDGE_URL=http://127.0.0.1:18787` in Trade.
+For deployed Trade, use a reachable HTTPS gateway or an encrypted Tailscale link.
+
+The bridge negotiates the OpenAI session. The browser sends and receives WebRTC
+audio directly with OpenAI, and the briefing tools authenticate with Trade.
+
+### Trade owner handoff
+
+Trade Super Admin can set an optional internal Yeastar extension on each DID
+mapping. Sophie asks for caller consent before transferring. The bridge
+rechecks the mapping before Asterisk rings the owner for 25 seconds. If the
+extension is unavailable, the caller hears the Asterisk unavailable announcement.
+
+1. In Trade Super Admin, edit the existing DID mapping for Nira Electrical
+   Lynbrook (`0359111403`) and save `3101` as its forwarding extension. Save the
+   internal owner extension for any other DID that should support forwarding.
+2. In the live `from-yeastar` dialplan, ensure
+   `Set(__BMS_CALLER_CHANNEL=${CHANNEL})` runs before the WebSocket dial. Add only
+   the separate `bms-trade-owner-handoff` context from
+   `deploy/asterisk/extensions.conf.example`. Keep your existing ringing and
+   greeting priorities. Keep the new context private and allow the Yeastar
+   account used by Asterisk to call internal destinations only.
+3. Add the loopback AMI configuration from `deploy/asterisk/manager-handoff.conf.example`
+   to your existing `manager.conf` and set a strong random secret.
+4. The bridge uses `BMSPRO_HANDOFF_AMI_USER=bms-owner-handoff` and
+   `BMSPRO_HANDOFF_AMI_SECRET` matching the existing AMI account. The old
+   `BMSPRO_NIRA_HANDOFF_BUSINESS_ID` setting can be removed.
+5. Reload the dialplan, restart the updated bridge, and test transfers on two
+   mapped DIDs, including an unanswered transfer.
+
 ### Dialog manager
 
 `src/dialog/dialog-manager.mjs` keeps per-call conversation state for every mode
