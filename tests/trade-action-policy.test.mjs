@@ -116,3 +116,57 @@ test('advice can prepare and submit without a published service while retaining 
   assert.equal(sent[0].args.serviceId, null); assert.deepEqual(sent[0].args.customRequest, advice.customRequest);
   assert.equal(calls.some(call => call.name === 'list_services'), false);
 });
+
+test('knowledge search is allowed only when advertised, sends only the question and fails closed on bad results', async () => {
+  const off = createTradeActionPolicy(new Map(names.map(name => [name, {}])), async () => ({status: 'FOUND', passages: [{title: 't', text: 'x'}]}));
+  assert.ok(!off.names.includes('search_business_knowledge'));
+  assert.equal((await off.call('search_business_knowledge', {question: 'Is there a fee?'})).status, 'REJECTED');
+
+  const calls = [];
+  let reply = {status: 'FOUND', passages: [{title: 'Call-out fee', text: 'Call-out fee\n$90 in our area.'}], message: 'data'};
+  const policy = createTradeActionPolicy(new Map([...names, 'search_business_knowledge'].map(name => [name, {}])), async (name, args) => {
+    calls.push({name, args}); return reply;
+  });
+  assert.ok(policy.names.includes('search_business_knowledge'));
+  assert.equal((await policy.call('search_business_knowledge', {question: '  Is there a\ncall-out fee? '})).status, 'FOUND');
+  assert.deepEqual(calls.at(-1), {name: 'search_business_knowledge', args: {question: 'Is there a call-out fee?'}});
+
+  for (const bad of [{question: 'fee', businessId: 'b'}, {question: 'x'}, {question: 'a'.repeat(301)}, {question: 5}, {}])
+    assert.equal((await policy.call('search_business_knowledge', bad)).status, 'REJECTED');
+  assert.equal(calls.length, 1);
+
+  reply = {status: 'NO_MATCH', passages: [], message: 'none'};
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Do you work Sundays?'})).status, 'NO_MATCH');
+  for (const invalid of [{status: 'FOUND', passages: []}, {status: 'BOOKED', passages: []}, {status: 'FOUND', passages: [{title: 't', text: 'x'.repeat(2001)}]}, null]) {
+    reply = invalid;
+    assert.equal((await policy.call('search_business_knowledge', {question: 'Is there a fee?'})).status, 'UNAVAILABLE');
+  }
+});
+
+test('a repeated knowledge question in one call is answered from this call without another Trade request', async () => {
+  let requests = 0, reply = {status: 'FOUND', passages: [{title: 'Call-out fee', text: '$90 in our area.'}], message: 'data'};
+  const policy = createTradeActionPolicy(new Map([...names, 'search_business_knowledge'].map(name => [name, {}])), async () => { requests++; return reply; });
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Is there a call-out fee?'})).status, 'FOUND');
+  const again = await policy.call('search_business_knowledge', {question: 'is there a call out fee'});
+  assert.equal(again.status, 'FOUND');
+  assert.equal(again.passages[0].text, '$90 in our area.');
+  assert.equal(requests, 1);
+  again.passages[0].text = 'changed by caller code';
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Is there a call-out fee?'})).passages[0].text, '$90 in our area.');
+
+  // Failures are not remembered, so the next ask tries Trade again.
+  reply = null;
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Do you work Sundays?'})).status, 'UNAVAILABLE');
+  reply = {status: 'NO_MATCH', passages: [], message: 'none'};
+  assert.equal((await policy.call('search_business_knowledge', {question: 'Do you work Sundays?'})).status, 'NO_MATCH');
+  assert.equal(requests, 3);
+});
+
+test('Trade tool timeouts: knowledge fails fast, other reads in 20 s, writes keep 40 s', async () => {
+  const {toolTimeoutMs} = await import('../src/agents/trade/trade-tools.mjs');
+  assert.equal(toolTimeoutMs('search_business_knowledge'), 12000);
+  assert.equal(toolTimeoutMs('get_available_slots'), 20000);
+  assert.equal(toolTimeoutMs('list_services'), 20000);
+  for (const name of ['create_inspection_request', 'create_job_booking', 'register_customer', 'reschedule_job', 'cancel_job'])
+    assert.equal(toolTimeoutMs(name), 40000);
+});

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createDraftTypingCue, pcmuHasSpeech} from '../src/audio/draft-typing.mjs';
+import {createDraftTypingCue, pcmuHasSpeech, TYPING_LOOP_FRAMES} from '../src/audio/draft-typing.mjs';
 
 test('typing waits for a slow save and an answered, speech-free playback window', () => {
   let time = 0;
@@ -42,7 +42,7 @@ test('typing loops whole PCMU frames and call instances have independent state',
   const b = createDraftTypingCue({now: () => time});
   a.start(); b.start(); time = 400;
   const first = a.frame(true);
-  for (let i = 1; i < 80; i++) assert.equal(a.frame(true).length, 160);
+  for (let i = 1; i < TYPING_LOOP_FRAMES; i++) assert.equal(a.frame(true).length, 160);
   assert.deepEqual(a.frame(true), first);
   assert.deepEqual(b.frame(true), first);
   a.stop();
