@@ -7,6 +7,13 @@ const toolNames = new Set([
   'get_daily_summary',
   'get_day_activity',
   'get_staff_day_report',
+  'list_missed_calls',
+  'list_overdue_invoices',
+  'list_invoices',
+  'lookup_customer_jobs',
+  'suggest_scheduling',
+  'list_quote_follow_ups',
+  'get_sophie_call_summaries',
   'list_jobs_awaiting_scheduling',
   'get_staff_working_today',
 ]);
