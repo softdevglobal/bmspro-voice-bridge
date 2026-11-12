@@ -15,6 +15,7 @@ import {createVoiceStudioShadow} from '../asr/voice-studio-shadow.mjs'; // side 
 import {createCallTranscript} from '../observability/call-transcript.mjs'; // per-call transcript file writer
 import {createCallRecord, sendTradeCallRecord} from '../observability/call-record.mjs'; // call log saved to Trade (Firebase) after hang-up
 import {createOwnerVoiceHandler} from './owner-voice.mjs';
+import {createLiveListen} from './live-listen.mjs';
 import {loadOwnerHandoff, ownerHandoffReadiness, redirectToOwner} from './owner-handoff.mjs';
 
 // Independent tenant and tool state per call; no application duration cutoff.
@@ -108,7 +109,13 @@ const ownerVoice = process.env.BMSPRO_OWNER_VOICE_ENABLED === 'true' && tenantRo
     })
   : null;
 // ---- HTTP server for health checks and authenticated owner voice setup ----
+const liveListen = process.env.BMSPRO_LIVE_LISTEN_ENABLED === 'true' && tenantRoutes.directTrade
+  ? createLiveListen(tenantRoutes.directTrade.token) : null;
 const server = http.createServer((req, res) => {
+  if (liveListen && !shuttingDown && /^\/live-listen\/(calls$|audio\?)/.test(req.url ?? '')) {
+    liveListen.handle(req, res);
+    return;
+  }
   if (req.url === '/owner-voice/session' && ownerVoice && !shuttingDown) {
     void ownerVoice(req, res);
     return;
@@ -132,6 +139,7 @@ server.on('upgrade', (req, socket, head) => {
 // =============================================================================
 wss.on('connection', media => {
   const callId = randomUUID(); // full unique caller ID
+  let listenerFeed;
   const id = callId.slice(0, 8); // short ID for log lines
   const log = message => console.log(`${new Date().toISOString()} [${id}] ${message}`);
   // Transcript file writer 
@@ -246,6 +254,7 @@ wss.on('connection', media => {
   const finish = (reason, hangupMedia = true) => {
     if (closing) return;
     closing = true;
+    listenerFeed?.close();
     endReason = reason;
     clearTimeout(setupTimer); pump.stop();
     inputAudio.stop();
@@ -295,6 +304,7 @@ wss.on('connection', media => {
     // Only send when OpenAI is ready, the call is open, and the upstream buffer is under 64 KB.
     canSend: () => ready && !closing && live?.socket.readyState === 1 && live.socket.platformSocket.bufferedAmount <= 64000,
     send: frame => {
+      listenerFeed?.input(frame);
       live.send({type: 'session.input_audio.append', audio: frame.toString('base64')});
       inputBytes += frame.length;
     },
@@ -421,6 +431,7 @@ wss.on('connection', media => {
     const typingFrame = draftTyping.frame(!speech && answeredAt !== undefined && performance.now() - lastSpeechPlaybackAt >= 180);
     if (typingFrame) typingFrame.copy(frame);
     media.send(frame); outputBytes += typingFrame ? frame.length : length;
+    listenerFeed?.output(frame);
     if (hangup.shouldHangUp({now: performance.now(), queuedBytes: queue.length, lastSpeechPlaybackAt}))
       return finish('Sophie ended the call after saying goodbye');
     if (length && firstPlaybackAt === undefined) {
@@ -701,6 +712,7 @@ wss.on('connection', media => {
             // until actual greeting audio is available, not just session.started.
             command('ANSWER');
             answeredAt = performance.now();
+            listenerFeed = liveListen?.start(callId, businessConfig);
             clearTimeout(setupTimer);
             reportActivity('call_answered', {status: 'answered'});
             callRecord.answered();
