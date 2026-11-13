@@ -61,10 +61,19 @@ test('owner voice accepts any known read-only tools, but not unknown or repeated
     'list_jobs_awaiting_scheduling', 'get_staff_working_today'])).status, 200);
   assert.equal((await start(['get_daily_summary', 'list_jobs_awaiting_scheduling',
     'get_staff_working_today'])).status, 200);
-  assert.equal(upstream.mock.callCount(), 2);
+  // Trade with owner knowledge enabled adds the knowledge search.
+  assert.equal((await start(['get_daily_summary', 'get_day_activity', 'get_staff_day_report',
+    'list_jobs_awaiting_scheduling', 'get_staff_working_today', 'search_business_knowledge'])).status, 200);
+  // Trade with voice knowledge drafts enabled adds the three browser-side draft tools.
+  assert.equal((await start(['get_daily_summary', 'get_day_activity', 'get_staff_day_report',
+    'list_jobs_awaiting_scheduling', 'get_staff_working_today', 'search_business_knowledge',
+    'prepare_knowledge_draft', 'save_knowledge_draft', 'discard_knowledge_draft'])).status, 200);
+  assert.equal(upstream.mock.callCount(), 4);
 
   assert.equal((await start(['get_daily_summary', 'create_job'])).status, 400, 'unknown tool');
+  assert.equal((await start(['get_daily_summary', 'search_knowledge'])).status, 400, 'unknown knowledge tool name');
+  assert.equal((await start(['get_daily_summary', 'publish_knowledge'])).status, 400, 'no publish tool');
   assert.equal((await start(['get_daily_summary', 'get_daily_summary'])).status, 400, 'repeated tool');
   assert.equal((await start([])).status, 400, 'no tools');
-  assert.equal(upstream.mock.callCount(), 2);
+  assert.equal(upstream.mock.callCount(), 4);
 });

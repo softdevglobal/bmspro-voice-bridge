@@ -9,6 +9,15 @@ const toolNames = new Set([
   'get_staff_day_report',
   'list_jobs_awaiting_scheduling',
   'get_staff_working_today',
+  // Read-only knowledge base (RAG) search, offered only when Trade enables it.
+  'search_business_knowledge',
+  // Voice knowledge drafts, offered only when Trade enables them. These run in
+  // the owner's browser, never here: prepare only shows a note on screen, and save
+  // creates an unpublished draft through Trade's normal owner API after the owner
+  // confirms. Nothing reaches callers until the owner publishes it in Trade.
+  'prepare_knowledge_draft',
+  'save_knowledge_draft',
+  'discard_knowledge_draft',
 ]);
 
 function validTools(tools) {
