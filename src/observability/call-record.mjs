@@ -24,8 +24,12 @@ export function createCallRecord({callId, now = () => Date.now()}) {
   const turns = [], tools = [], outcomes = [], seen = new Set();
   let answeredAt = null, endedAt = null, endReason = null, setupMs = null, callerNumber = null, totalChars = 0;
   let last;   // {speaker, endMs} of the latest fragment, to merge fragments into turns
+  let callbackAttemptId;
 
   return {
+    callback(id) {
+      if (typeof id === 'string' && /^[a-f0-9]{64}$/.test(id)) callbackAttemptId = id;
+    },
     /** Same OpenAI transcript events the transcript file uses; fragments are merged into turns. */
     event(event) {
       const speaker = speakers.get(event?.type);
@@ -75,6 +79,7 @@ export function createCallRecord({callId, now = () => Date.now()}) {
         setupMs,
         endReason: endReason ?? 'call ended',
         callerNumber,
+        ...(callbackAttemptId && {callbackAttemptId}),
         tools,
         outcomes,
         transcript: turns.map(turn => ({...turn, text: turn.text.trim()})).filter(turn => turn.text.length),

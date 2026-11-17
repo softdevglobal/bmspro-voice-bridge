@@ -170,6 +170,7 @@ export async function resolveConfigForDid(did, routes, fetcher = fetch) {
         };
         // Return the direct Trade config pinned to this business. The shared backend (activityUrl/Token) is used for activity records.
         return {mode: 'trade', url: routes.directTrade.url, token: routes.directTrade.token, did, businessId: route.businessId,
+          ...(route.callback && {callback: route.callback}),
           ...(typeof route.forwardingExtension === 'string' && {forwardingExtension: route.forwardingExtension}),
           ...(profile && {discoveredProfile: profile}),
           activityUrl: routes.config.url, activityToken: routes.config.token, routingHeaders: {'X-BMSPro-DID': did, 'X-BMSPro-Trade-Business': route.businessId}};
