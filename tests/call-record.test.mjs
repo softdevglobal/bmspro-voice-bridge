@@ -5,6 +5,16 @@ import {createCallRecord, sendTradeCallRecord} from '../src/observability/call-r
 const callId = '0a41e31d-0620-47d1-9ef9-c9c60cef73a8';
 const speech = (type, delta, start, end, id) => ({type: `session.${type}_transcript.delta`, delta, start_ms: start, end_ms: end, event_id: id});
 
+test('callback transcripts carry the originating attempt ID', () => {
+  const record = createCallRecord({callId});
+  assert.equal(record.build().callbackAttemptId, undefined);
+  record.callback('invalid');
+  assert.equal(record.build().callbackAttemptId, undefined);
+  const attemptId = 'a'.repeat(64);
+  record.callback(attemptId);
+  assert.equal(record.build().callbackAttemptId, attemptId);
+});
+
 test('fragments merge into speaker turns; duplicates, bad timings and post-hangup text are ignored', () => {
   let time = 1_000_000;
   const record = createCallRecord({callId, now: () => time});

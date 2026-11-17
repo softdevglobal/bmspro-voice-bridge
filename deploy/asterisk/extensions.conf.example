@@ -4,10 +4,17 @@
 exten => 2000,1,Set(__BMS_ROUTE_INFO=${PJSIP_HEADER(read,Alert-Info)})
  same => n,GotoIf($[${LEN(${BMS_ROUTE_INFO})}=0]?reject)
  same => n,Set(__BMS_CALLER_CHANNEL=${CHANNEL})
+ same => n,Set(__BMS_CALLER_ID=${CALLERID(num)})
  same => n,Ringing()
  same => n,Dial(WebSocket/bmspro-media/c(ulaw)f(json)n,65,r)
  same => n,Hangup()
  same => n(reject),Hangup(21)
+
+; Only the local AMI callback originator enters this context after answer.
+[bms-sophie-callback]
+exten => s,1,GotoIf($[${REGEX("^[a-f0-9]{48}$" ${BMS_CALLBACK_TOKEN})}=0]?reject)
+ same => n,Dial(WebSocket/bmspro-media/c(ulaw)f(json)n,65)
+ same => n(reject),Hangup()
 
 ; AMI redirects the original caller here with the saved Trade extension.
 ; Keep this context out of any public/inbound include list.
