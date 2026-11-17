@@ -10,3 +10,11 @@ deny = 0.0.0.0/0.0.0.0
 permit = 127.0.0.1/255.255.255.255
 read = none
 write = call
+
+; Separate account for the opt-in callback pilot.
+[bms-sophie-callback]
+secret = REPLACE_WITH_A_SEPARATE_STRONG_RANDOM_SECRET
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
+read = call
+write = originate

@@ -59,6 +59,46 @@ Enable `BMSPRO_OWNER_VOICE_ENABLED=true` on the bridge. It uses the existing
 For local Trade development, forward a port to the existing loopback listener
 with `ssh -NT -o ExitOnForwardFailure=yes -L 127.0.0.1:18787:127.0.0.1:8787 dev@100.88.220.83`
 and set `AI_OWNER_VOICE_BRIDGE_URL=http://127.0.0.1:18787` in Trade.
+
+### Sophie outbound callback pilot
+
+For automatic callbacks, deploy the updated Trade app and bridge
+`src/server/sophie-callback.mjs` and `src/routing/tenant-routing.mjs`. Keep the
+callback flag and AMI credentials below. In **Super Admin → DID mappings**,
+enable callbacks and automatic callbacks for each DID, and save its approved
+outbound caller ID and Yeastar dial prefix. Those mappings supply the dial
+settings and the missed-call record supplies the destination. The pilot DID,
+mobile and prefix environment variables are only used for legacy manual callbacks.
+
+Trade's authenticated `/api/cron/sophie-callbacks` runs every five minutes. It
+checks new missed calls from after automatic callbacks were enabled (within the
+last 24 hours), calls once, and allows up to three more attempts spaced at least
+90 minutes apart. An answered return call to the same business or an answered
+Sophie callback resolves the missed call. The cron needs Trade's existing
+`CRON_SECRET` and a bridge URL reachable from the deployment.
+
+On the server, add the callback context from
+`deploy/asterisk/extensions.conf.example` and the separate callback AMI user from
+`deploy/asterisk/manager-handoff.conf.example`. Reload the dialplan and AMI.
+Set these in the bridge environment, using a mobile you control and an active
+Trade DID. Match the AMI secret to the server's manager configuration.
+
+```dotenv
+BMSPRO_CALLBACK_ENABLED=true
+BMSPRO_CALLBACK_PILOT_DID=0359111403
+BMSPRO_CALLBACK_PILOT_MOBILE=<Australian mobile as 04 digits or Sri Lankan mobile as 947 digits>
+BMSPRO_CALLBACK_AMI_USER=bms-sophie-callback
+BMSPRO_CALLBACK_AMI_SECRET=<separate AMI secret>
+BMSPRO_CALLBACK_DIAL_PREFIX=
+```
+
+Set the dial prefix only if the Yeastar outbound route requires one, for example
+`0011` or `+` for an international route configured to accept that format. Confirm the
+trunk can dial the mobile and present the business DID. Restart the bridge.
+Set `AI_SOPHIE_CALLBACK_ENABLED=true` in Trade and use the existing
+`AI_OWNER_VOICE_BRIDGE_URL` and bridge secret. Call the pilot DID from the test
+mobile and let it become a missed call. In Trade, open **Calls → Missed calls**
+and choose **Call back with Sophie**.
 For deployed Trade, use a reachable HTTPS gateway or an encrypted Tailscale link.
 
 The bridge negotiates the OpenAI session. The browser sends and receives WebRTC

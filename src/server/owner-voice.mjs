@@ -14,6 +14,7 @@ const toolNames = new Set([
   'suggest_scheduling',
   'list_quote_follow_ups',
   'get_sophie_call_summaries',
+  'get_customer_call_history',
   'list_jobs_awaiting_scheduling',
   'get_staff_working_today',
 ]);

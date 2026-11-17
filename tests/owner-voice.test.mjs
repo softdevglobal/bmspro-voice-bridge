@@ -59,7 +59,7 @@ test('owner voice accepts any known read-only tools, but not unknown or repeated
   // Current and older Trade tool sets both work.
   assert.equal((await start(['get_daily_summary', 'get_day_activity', 'get_staff_day_report',
     'list_missed_calls', 'list_overdue_invoices', 'list_invoices', 'list_jobs_awaiting_scheduling', 'get_staff_working_today',
-    'lookup_customer_jobs', 'suggest_scheduling', 'list_quote_follow_ups', 'get_sophie_call_summaries'])).status, 200);
+    'lookup_customer_jobs', 'suggest_scheduling', 'list_quote_follow_ups', 'get_sophie_call_summaries', 'get_customer_call_history'])).status, 200);
   assert.equal((await start(['get_daily_summary', 'list_jobs_awaiting_scheduling',
     'get_staff_working_today'])).status, 200);
   assert.equal(upstream.mock.callCount(), 2);
