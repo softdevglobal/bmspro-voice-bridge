@@ -19,6 +19,32 @@ import {createLiveListen} from './live-listen.mjs';
 import {loadOwnerHandoff, ownerHandoffReadiness, redirectToOwner} from './owner-handoff.mjs';
 import {createSophieCallback} from './sophie-callback.mjs';
 
+const SCHEDULE_CUSTOMER_CALLBACK_TOOL = {
+  type: 'function', name: 'schedule_customer_callback', strict: false,
+  description: 'Capture the current outbound customer’s explicit request for a callback. The bridge submits it to Trade after hangup. Use delayMinutes for relative requests like “in five minutes” or “within five minutes”. For an explicit date and time, use scheduledAt. Supply exactly one.',
+  parameters: {type: 'object', properties: {
+    scheduledAt: {type: 'string', format: 'date-time', description: 'ISO 8601 timestamp with an explicit timezone offset for the agreed local time.'},
+    delayMinutes: {type: 'integer', minimum: 1, maximum: 43200},
+    customerConfirmed: {type: 'boolean', const: true},
+  }, required: ['customerConfirmed'], additionalProperties: false},
+};
+const CALLBACK_REQUEST_RULE = 'For a clear callback request, immediately use schedule_customer_callback, even while the other Trade tools are connecting. “Within five minutes” means delayMinutes: 5. A clear request already counts as confirmation; only clarify an ambiguous time. On CAPTURED, say only a short acknowledgement and goodbye, such as “Okay, I’ll let you go. Thanks!” The bridge ends the call after that line and submits the request. Do not call end_call separately for this request or say it has been scheduled. Never schedule for voicemail or the wrong person.';
+const RECORD_CUSTOMER_OPT_OUT_TOOL = {
+  type: 'function', name: 'record_customer_do_not_call', strict: false,
+  description: 'Record the current outbound-call customer’s explicit request to stop receiving calls from this business.',
+  parameters: {type: 'object', properties: {
+    customerConfirmed: {type: 'boolean', const: true},
+  }, required: ['customerConfirmed'], additionalProperties: false},
+};
+const normalizeOptOutNumber = value => {
+  const number = String(value ?? '').trim().replace(/[\s().-]/g, '');
+  if (/^0[23478]\d{8}$/.test(number) || /^947\d{8}$/.test(number)) return number;
+  const au = /^(?:\+?61|0061)([23478]\d{8})$/.exec(number);
+  if (au) return `0${au[1]}`;
+  const lk = /^(?:\+?94|0094)(7\d{8})$/.exec(number);
+  return lk ? `94${lk[1]}` : null;
+};
+
 // Independent tenant and tool state per call; no application duration cutoff.
 // Refuse to start without the OpenAI Api key.
 if (!process.env.OPENAI_API_KEY) throw new Error('Set OPENAI_API_KEY in .env first.');
@@ -170,8 +196,9 @@ wss.on('connection', media => {
     .replace(/\+?(?:\d[\s().-]*){8,}/g, '[redacted-number]')
     .replace(/\b(?:sk|sess|re)_[A-Za-z0-9_-]{12,}\b/g, '[redacted-token]')
     .replace(/[^\x20-\x7E]/g, '?').slice(0, 240);
-  let live, businessSession, businessConfig, voiceStudioShadow, connecting = false, ready = false, closing = false, paused = false, released = false;
+  let live, businessSession, businessConfig, outbound, activeCallerNumber, activeCallerOptOutNumber, voiceStudioShadow, connecting = false, ready = false, closing = false, paused = false, released = false;
   let activityConfig, activityStartedAt, ownerDestination, handoffAttempted = false;
+  let pendingCallback;
   let dialog = null; // per-call dialog manager, created once the agent session is open
   let toolQueue = Promise.resolve();
   const handledCalls = new Set();
@@ -279,6 +306,20 @@ wss.on('connection', media => {
     // The call log is sent once that outcome is known, so it records the real result.
     callRecord.end(reason);
     void toolQueue.catch(() => {})
+      .then(async () => {
+        if (!pendingCallback) return;
+        const {url, headers, body} = pendingCallback;
+        try {
+          const response = await fetch(url, {
+            method: 'POST', redirect: 'error', signal: AbortSignal.timeout(20_000), headers, body,
+          });
+          const result = await response.json().catch(() => null);
+          const saved = response.ok && ['SCHEDULED', 'ALREADY_SCHEDULED'].includes(result?.status);
+          log(`Callback after hangup: status=${saved ? result.status : 'FAILED'}${saved ? '' : ` code=${safeCode(result?.code || `HTTP_${response.status}`)}`}`);
+        } catch (error) {
+          log(`Callback after hangup: status=FAILED code=${safeCode(error?.cause?.code || error?.code || error?.name)}`);
+        }
+      })
       .then(() => sendTradeCallRecord({config: businessConfig, businessId: businessSession?.profile?.businessId, record: callRecord, log}))
       .then(() => businessSession?.close()).catch(() => {});
     queue = Buffer.alloc(0);
@@ -337,17 +378,72 @@ wss.on('connection', media => {
       const toolStartedAt = performance.now();
       let result;
       const endCall = item.name === END_CALL_TOOL.name;
-      const allowed = endCall || (toolsEnabled && businessSession?.tools.some(tool => tool.name === item.name) === true);
+      const scheduleCallback = item.name === SCHEDULE_CUSTOMER_CALLBACK_TOOL.name;
+      const recordCustomerOptOut = item.name === RECORD_CUSTOMER_OPT_OUT_TOOL.name;
+      const allowed = endCall || (scheduleCallback && !!outbound) ||
+        (recordCustomerOptOut && businessConfig?.mode === 'trade' && !!activeCallerOptOutNumber) ||
+        (toolsEnabled && businessSession?.tools.some(tool => tool.name === item.name) === true);
       try {
         if (!allowed || typeof item.arguments !== 'string' || item.arguments.length > (businessConfig.mode === 'onboarding' ? 65536 : 8192))
           throw new Error('Invalid tool request');
         const args = JSON.parse(item.arguments);
         // Dialog manager: block a write whose earlier steps are not done yet.
-        const blocked = endCall ? null : dialog?.check(item.name) ?? null;
+        const blocked = endCall || scheduleCallback ? null : dialog?.check(item.name) ?? null;
         if (endCall) {
           // Handled by the bridge: hang up once Sophie's goodbye has played (see the audio pump).
           result = hangup.request(performance.now());
           log('End call: requested by Sophie; hanging up after her goodbye.');
+        } else if (scheduleCallback) {
+          draftTyping.stop();
+          const relative = Number.isInteger(args?.delayMinutes) && args.delayMinutes >= 1 && args.delayMinutes <= 43200;
+          const absolute = typeof args?.scheduledAt === 'string' &&
+            /(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(args.scheduledAt) && Number.isFinite(Date.parse(args.scheduledAt));
+          if (pendingCallback) {
+            result = {status: 'CAPTURED'};
+          } else if (!outbound?.attemptId || args?.customerConfirmed !== true || relative === absolute ||
+              (relative && args.scheduledAt !== undefined) || (absolute && args.delayMinutes !== undefined) ||
+              !businessConfig?.url || !businessConfig?.token || businessConfig.mode !== 'trade' || !businessConfig.businessId) {
+            result = {status: 'REJECTED', code: 'INVALID_CALLBACK_REQUEST'};
+          } else {
+            const url = new URL(businessConfig.url);
+            url.pathname = '/api/ai/callbacks/schedule';
+            url.search = '';
+            const scheduledAt = relative ? new Date(Date.now() + args.delayMinutes * 60_000).toISOString() : args.scheduledAt;
+            pendingCallback = {
+              url,
+              headers: {Authorization: `Bearer ${businessConfig.token}`, 'X-BMSPro-DID': businessConfig.did,
+                'X-BMSPro-Trade-Business': businessConfig.businessId, 'Content-Type': 'application/json'},
+              body: JSON.stringify({callbackAttemptId: outbound.attemptId, number: outbound.number, scheduledAt}),
+            };
+            hangup.request(performance.now());
+            result = {status: 'CAPTURED', message: 'Say a brief acknowledgement and goodbye now. The callback request will be submitted after hangup.'};
+          }
+        } else if (recordCustomerOptOut) {
+          if (args?.customerConfirmed !== true || !businessConfig?.url || !businessConfig?.token ||
+              businessConfig.mode !== 'trade' || !businessConfig.businessId || !activeCallerOptOutNumber ||
+              (outbound && !outbound.attemptId)) {
+            result = {status: 'REJECTED', code: 'CUSTOMER_CONFIRMATION_REQUIRED'};
+          } else {
+            draftTyping.start();
+            try {
+              const url = new URL(businessConfig.url);
+              url.pathname = '/api/ai/callbacks/opt-out';
+              url.search = '';
+              const response = await fetch(url, {
+                method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15_000),
+                headers: {Authorization: `Bearer ${businessConfig.token}`, 'X-BMSPro-DID': businessConfig.did,
+                  'X-BMSPro-Trade-Business': businessConfig.businessId, 'Content-Type': 'application/json'},
+                body: JSON.stringify({...(outbound ? {callbackAttemptId: outbound.attemptId} : {}),
+                  number: activeCallerOptOutNumber, callDirection: outbound ? 'outbound' : 'inbound', customerConfirmed: true}),
+              });
+              const payload = await response.json().catch(() => null);
+              result = response.ok && payload?.status === 'RECORDED'
+                ? {status: 'RECORDED'} : {status: 'UNAVAILABLE', code: safeCode(payload?.code || `HTTP_${response.status}`)};
+            } catch (error) {
+              log(`Customer call opt-out save failed: code=${safeCode(error?.cause?.code || error?.code || error?.name || 'unknown')}`);
+              result = {status: 'UNAVAILABLE', code: 'OPT_OUT_SAVE_FAILED'};
+            }
+          }
         } else if (item.name === 'transfer_to_owner') {
           if (!ownerDestination || answeredAt === undefined || handoffAttempted ||
               !args || Object.keys(args).length !== 1 || args.callerConfirmed !== true) {
@@ -381,7 +477,7 @@ wss.on('connection', media => {
             ['UNAVAILABLE', 'REJECTED', 'UNKNOWN', 'STEP_REQUIRED', 'RETRY_LIMIT'].includes(result.status)) draftTyping.stop();
       }
       // Dialog manager: update progress, then add the current step and next hint for the AI.
-      if (allowed && !endCall) dialog?.record(item.name, result);
+      if (allowed && !endCall && !scheduleCallback) dialog?.record(item.name, result);
       const resultText = JSON.stringify(dialog ? dialog.annotate(result) : result);
       const rejectionCodes = new Map([
         ["Black's safe AI booking contract is not deployed. Transfer to staff.", 'BLACK_AI_BOOKING_CONTRACT_NOT_READY'],
@@ -396,7 +492,9 @@ wss.on('connection', media => {
       const backendCode = typeof result.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(result.code)
         ? result.code
         : undefined;
-      const reason = result.status === 'REJECTED' ? ` reason=${backendCode || rejectionCodes.get(result.message) || 'UNCLASSIFIED_REJECTION'}` : '';
+      const reason = result.status === 'REJECTED'
+        ? ` reason=${backendCode || rejectionCodes.get(result.message) || 'UNCLASSIFIED_REJECTION'}`
+        : result.status === 'UNAVAILABLE' && backendCode ? ` code=${backendCode}` : '';
       reportActivity('mcp_tool', {toolName: safeCode(allowed ? item.name : 'unexpected'), status: safeCode(result.status || 'completed'), durationMs: Math.round(performance.now() - toolStartedAt)});
       callRecord.tool(allowed ? item.name : 'unexpected', result, performance.now() - toolStartedAt);
       if (allowed && item.name === 'submit_for_owner_review') {
@@ -413,7 +511,11 @@ wss.on('connection', media => {
         output: resultText.length <= 128000 ? resultText : JSON.stringify({status: 'UNAVAILABLE', message: 'Business response too large; ask staff to verify. Do not infer a booking result.'}),
       }});
       live.send({type: 'response.create'});
-    }).catch(() => finish('tool continuation failed'));
+    }).catch(error => {
+      const code = safeCode(error?.code || error?.name || 'unknown');
+      log(`Tool continuation failed: tool=${safeCode(item?.name)} code=${code}`);
+      finish(`tool continuation failed: ${safeCode(item?.name)} ${code}`);
+    });
   };
   // Send actual PCMU frames from the moment the route is accepted, even before
   // OpenAI is ready. The Yeastar relay/NAT may need outbound RTP to learn the
@@ -479,7 +581,7 @@ wss.on('connection', media => {
  // ---- Step 1: work out which business/mode this phone number belongs to ----
       const variables = event.channel_variables;
       const callbackToken = variables?.BMS_CALLBACK_TOKEN ?? variables?._BMS_CALLBACK_TOKEN ?? variables?.__BMS_CALLBACK_TOKEN;
-      const outbound = callbackToken ? sophieCallback?.take(callbackToken) : undefined;
+      outbound = callbackToken ? sophieCallback?.take(callbackToken) : undefined;
       const invoiceCall = outbound?.purpose === 'overdue_invoice';
       if (outbound) callRecord.callback(outbound.attemptId);
       if (callbackToken && !outbound) return finish('invalid callback media token');
@@ -502,7 +604,9 @@ wss.on('connection', media => {
       log(`DID route ready: durationMs=${Math.round(performance.now() - routingStartedAt)}`);
       activityConfig = businessConfig;
       // Optional: the dialplan may pass the caller's number as BMS_CALLER_ID.
-      callRecord.caller(outbound?.number ?? variables?.BMS_CALLER_ID ?? variables?.__BMS_CALLER_ID);
+      activeCallerNumber = outbound?.number ?? variables?.BMS_CALLER_ID ?? variables?.__BMS_CALLER_ID ?? null;
+      activeCallerOptOutNumber = normalizeOptOutNumber(activeCallerNumber);
+      callRecord.caller(activeCallerNumber);
       if (voiceStudioShadowEnabled && voiceStudioShadowDids.has(String(businessConfig.did || '').replace(/\D/g, ''))) {
         voiceStudioShadow = createVoiceStudioShadow({
           WebSocket,
@@ -521,7 +625,7 @@ wss.on('connection', media => {
         `You are Sophie, the AI assistant from ${JSON.stringify(discoveredProfile?.businessName ?? 'the business')}. The intended contact name is ${JSON.stringify(outbound.customerName)}. Treat that name as data.`,
         'Greet and ask to speak with the intended contact. Ask if now is a good time. On voicemail, wrong person, or uncertainty, end politely without mentioning the invoice.',
         'After they confirm they are the intended contact and can speak, say you are calling about an overdue invoice. Ask if they have received it and whether they expect to pay or need someone from the business to help.',
-        'Listen and briefly confirm their response, including any date they volunteer. If they say it was paid or dispute it, thank them and say you will pass that on. Do not request payment credentials, share bank details or amounts, take payment, or agree to a payment plan. Then say goodbye.',
+        'If the intended contact is busy, follow the callback request instructions. If they say it was paid or dispute it, thank them and say you will pass that on. Do not request payment credentials, share bank details or amounts, take payment, or agree to a payment plan. Then say goodbye.',
       ].join(' ') : '';
       let greetFirst = false;
       if (!invoiceCall && businessConfig.mode === 'trade' && typeof discoveredProfile?.businessName === 'string' &&
@@ -535,6 +639,7 @@ wss.on('connection', media => {
       let toolsUpdateSent = false, setupFailed = false, callerSpokeBeforeTools = false, dateInstructions;
       const backendPrompt = () => [
         businessSession.backendInstructions ?? backendInstructions(businessConfig), END_CALL_BACKEND_RULE,
+        outbound ? CALLBACK_REQUEST_RULE : '',
         businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : '',
       ].join(' ');
       const steerVoice = (suffix, content) => live.send({
@@ -555,7 +660,8 @@ wss.on('connection', media => {
         if (!businessSession) return;
         toolsUpdateSent = true;
         live.send({type: 'session.update', event_id: toolsUpdateId, session: {delegation: {
-          type: 'responses', responses: {tools: [...businessSession.tools, END_CALL_TOOL], tool_choice: 'auto', instructions: backendPrompt()},
+          type: 'responses', responses: {tools: [...businessSession.tools, ...(outbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL] : []),
+            ...(businessConfig.mode === 'trade' && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], tool_choice: 'auto', instructions: backendPrompt()},
         }}});
       };
 
@@ -619,7 +725,7 @@ wss.on('connection', media => {
       const greeting = invoiceCall
         ? 'Introduce yourself and ask to speak with the intended contact. Keep the reason for the call private until they confirm.'
         : outbound
-        ? `Say you are Sophie, the AI assistant from ${JSON.stringify(discoveredProfile?.businessName ?? businessConfig.businessName ?? 'the business they called')}. Say you are returning a missed call and ask if now is a good time. If they say no, thank them and end the call. Do not leave private information on voicemail.`
+        ? `Say you are Sophie, the AI assistant from ${JSON.stringify(discoveredProfile?.businessName ?? businessConfig.businessName ?? 'the business they called')}. Say you are returning a missed call and ask if now is a good time. Listen for a callback request if they are busy. Do not leave private information on voicemail.`
         : greetFirst
         ? `Greet the caller in English: "Hi, thanks for calling ${JSON.stringify(discoveredProfile.businessName)}. My name is Sophie, your AI receptionist. How can I help?" Then pause and listen. Pronounce Sophie as SOH-fee.`
         : openingGreeting(businessConfig);
@@ -640,7 +746,10 @@ wss.on('connection', media => {
               ? `You are the receptionist for ${JSON.stringify(discoveredProfile.businessName)}. Greet and listen while Trade connects. If a caller asks for a booking, business lookup or transfer before the tools are ready, acknowledge their request briefly and retain what they said. Wait for the tool-ready instruction before delegating. Never invent business details or claim an action succeeded without a verified result.`
               : businessSession.voiceInstructions ?? voiceInstructions(businessConfig),
             'Your name is Sophie. Identify yourself as Sophie, the AI assistant, in the opening greeting. For onboarding, you are Sophie from BMS Pro helping with business setup; do not ask the caller to choose an AI receptionist name.',
-            outbound && !invoiceCall ? 'This is an outbound callback. Ask if now is a good time. If you reach voicemail or the wrong person, do not disclose customer information or take any action. End the call.' : '',
+            outbound && !invoiceCall ? 'Ask if now is a good time. If they decline without asking for a callback, thank them and end the call. Keep customer information private on voicemail or with the wrong person.' : '',
+            outbound ? CALLBACK_REQUEST_RULE : '',
+            outbound ? 'If the verified customer clearly asks this business to stop calling them, call record_customer_do_not_call once. Do not use it for a request to call later. Confirm their request in a brief reply; if recording fails, say you could not save it and tell them the business will be notified. This records a business-specific opt-out.' : '',
+            businessConfig.mode === 'trade' && activeCallerOptOutNumber ? 'record_customer_do_not_call is available only for this current Trade call and takes no phone number. Use it only after the person has confirmed they are the intended customer and clearly asked not to receive further calls. Do not use it for requests to call later. Only say the block was saved after RECORDED; if it fails, say you could not save it and the business will be notified.' : '',
             'Keep routine replies to one or two short sentences and ask one question at a time. If backend work takes time, briefly acknowledge the request while waiting; do not announce an unverified result.',
             'If the caller starts talking while you are speaking, stop at once, listen to them and respond to what they said; do not finish or repeat the sentence you were saying.',
             END_CALL_VOICE_RULE,
@@ -653,10 +762,13 @@ wss.on('connection', media => {
           delegation: {type: 'responses', responses: {
             model: 'gpt-6-luna', parallel_tool_calls: false,
             ...backendSpeedSettings,
-            ...(greetFirst ? {
-              tools: [], tool_choice: 'none',
-              instructions: 'Trade is connecting. Retain the caller’s request and acknowledge it briefly. Do not claim an action was performed.',
-            } : {tools: [...businessSession.tools, END_CALL_TOOL], instructions: backendPrompt()}),
+            ...(greetFirst && !invoiceCall ? {
+              tools: outbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL, END_CALL_TOOL] : [],
+              tool_choice: outbound ? 'auto' : 'none',
+              instructions: outbound ? CALLBACK_REQUEST_RULE + ' ' + END_CALL_BACKEND_RULE
+                : 'Trade is connecting. Retain the caller’s request and acknowledge it briefly. Do not claim an action was performed.',
+            } : {tools: [...businessSession.tools, ...(outbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL] : []),
+              ...(businessConfig.mode === 'trade' && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], instructions: backendPrompt()}),
           }}
         }});
       };
@@ -694,7 +806,7 @@ wss.on('connection', media => {
           const usage = usageFromEvent(event);
           if (Object.keys(usage).length) reportActivity('usage_updated', {usage});
         }
-        if (!closing && answeredAt !== undefined && event.type === 'session.delegation.created') draftTyping.start();
+        if (!outbound && !closing && answeredAt !== undefined && event.type === 'session.delegation.created') draftTyping.start();
         if (event.type === 'response.event') {
           const nested = event.event ?? event.response_event;
           if (!closing && nested?.type === 'response.output_item.added' &&
