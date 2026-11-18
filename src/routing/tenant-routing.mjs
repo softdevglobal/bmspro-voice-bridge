@@ -1,24 +1,36 @@
 // This file's main responsibility is to identify which BMSPro product/business should handle an
 // incoming telephone call and provide the correct API endpoint and authentication credentials.
 
-
 // Loads the shared (Black) backend settings: the MCP URL and token from the environment.
 import {loadBusinessConfig} from '../agents/black/business-tools.mjs';
 
 // Runs once at startup. Reads .env, validates it, and builds the table of backend endpoints and secrets.
 export function loadTenantRoutes(env = process.env) {
   // The shared bridge secret is required; without it the bridge cannot authenticate to the backend.
-  if (!env.BMSPRO_BRIDGE_SECRET?.trim()) throw new Error('Set BMSPRO_BRIDGE_SECRET to the shared backend bridge credential.');
+  if (!env.BMSPRO_BRIDGE_SECRET?.trim())
+    throw new Error('Set BMSPRO_BRIDGE_SECRET to the shared backend bridge credential.');
   // Load the shared backend config, using the bridge secret as the token. The expected DID is cleared because the DID is looked up per call.
-  const config = loadBusinessConfig({...env, BMSPRO_MCP_SECRET: env.BMSPRO_BRIDGE_SECRET, BMSPRO_EXPECTED_DID: undefined});
+  const config = loadBusinessConfig({
+    ...env,
+    BMSPRO_MCP_SECRET: env.BMSPRO_BRIDGE_SECRET,
+    BMSPRO_EXPECTED_DID: undefined,
+  });
   // Will hold the list of onboarding phone numbers (DIDs).
   let dids;
   // Parse the onboarding DID list from JSON; use an empty list if the variable is not set.
-  try { dids = JSON.parse(env.BMSPRO_ONBOARDING_DIDS_JSON || '[]'); }
-  // Stop with a clear message if the JSON is malformed.
-  catch { throw new Error('BMSPRO_ONBOARDING_DIDS_JSON must be a JSON array of DID digits.'); }
+  try {
+    dids = JSON.parse(env.BMSPRO_ONBOARDING_DIDS_JSON || '[]');
+  } catch {
+    // Stop with a clear message if the JSON is malformed.
+    throw new Error('BMSPRO_ONBOARDING_DIDS_JSON must be a JSON array of DID digits.');
+  }
   // The list must be an array of at most 20 unique strings, each 6-15 digits long.
-  if (!Array.isArray(dids) || dids.length > 20 || dids.some(did => typeof did !== 'string' || !/^\d{6,15}$/.test(did)) || new Set(dids).size !== dids.length)
+  if (
+    !Array.isArray(dids) ||
+    dids.length > 20 ||
+    dids.some(did => typeof did !== 'string' || !/^\d{6,15}$/.test(did)) ||
+    new Set(dids).size !== dids.length
+  )
     throw new Error('Use unique 6-15 digit numbers in BMSPRO_ONBOARDING_DIDS_JSON.');
   // Trade (shared backend) endpoint: same host as the shared backend, Blue API path.
   const tradeUrl = new URL(config.url);
@@ -41,30 +53,54 @@ export function loadTenantRoutes(env = process.env) {
   // If either direct Trade setting is present, validate and enable direct Trade.
   if (directUrl || directSecret) {
     // The URL and the secret must be set together.
-    if (!directUrl || !directSecret) throw new Error('Direct Trade requires its URL and a dedicated bridge secret.');
+    if (!directUrl || !directSecret)
+      throw new Error('Direct Trade requires its URL and a dedicated bridge secret.');
     // Parse the direct Trade URL.
     const url = new URL(directUrl);
     // Split the host into numbers (e.g. 100.80.10.20 -> [100, 80, 10, 20]) to test for a Tailscale address.
     const octets = url.hostname.split('.').map(Number);
     // True if the host is a valid IPv4 address in Tailscale's range 100.64.0.0 - 100.127.255.255.
-    const tailscale = octets.length === 4 && octets.every(n => Number.isInteger(n) && n >= 0 && n <= 255) && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
+    const tailscale =
+      octets.length === 4 &&
+      octets.every(n => Number.isInteger(n) && n >= 0 && n <= 255) &&
+      octets[0] === 100 &&
+      octets[1] >= 64 &&
+      octets[1] <= 127;
     // True if the host is this machine (localhost) or a Tailscale address.
     const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) || tailscale;
     // The URL must use HTTPS (plain HTTP only for local/Tailscale hosts when BMSPRO_ALLOW_HTTP_FOR_LOCAL_TEST=true),
     // must not contain a username, password, query string or fragment, and the path must be /api/ai/mcp.
-    if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && local && env.BMSPRO_ALLOW_HTTP_FOR_LOCAL_TEST === 'true')) ||
-        url.username || url.password || url.search || url.hash || !/^\/api\/ai\/mcp\/?$/.test(url.pathname))
-      throw new Error('Direct Trade requires an HTTPS /api/ai/mcp URL, or explicitly enabled loopback/Tailscale HTTP for testing.');
+    if (
+      (url.protocol !== 'https:' &&
+        !(url.protocol === 'http:' && local && env.BMSPRO_ALLOW_HTTP_FOR_LOCAL_TEST === 'true')) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !/^\/api\/ai\/mcp\/?$/.test(url.pathname)
+    )
+      throw new Error(
+        'Direct Trade requires an HTTPS /api/ai/mcp URL, or explicitly enabled loopback/Tailscale HTTP for testing.',
+      );
     // The secret must be at least 32 characters, one line, not a placeholder,
     // and different from the shared token and the onboarding secret.
-    if (directSecret.length < 32 || /[\r\n]/.test(directSecret) || /YOUR_|REPLACE_/.test(directSecret) ||
-        directSecret === config.token || directSecret === env.BMSPRO_ONBOARDING_BRIDGE_SECRET?.trim())
+    if (
+      directSecret.length < 32 ||
+      /[\r\n]/.test(directSecret) ||
+      /YOUR_|REPLACE_/.test(directSecret) ||
+      directSecret === config.token ||
+      directSecret === env.BMSPRO_ONBOARDING_BRIDGE_SECRET?.trim()
+    )
       throw new Error('Use a separate direct Trade bridge secret of at least 32 characters.');
     // Discovery URL: the Trade endpoint that says which Trade business owns a DID.
     const discoveryUrl = new URL(url);
     discoveryUrl.pathname = '/api/ai/voice';
     // Save the direct Trade settings as a frozen (read-only) object.
-    directTrade = Object.freeze({url: url.toString(), token: directSecret, discoveryUrl: discoveryUrl.toString()});
+    directTrade = Object.freeze({
+      url: url.toString(),
+      token: directSecret,
+      discoveryUrl: discoveryUrl.toString(),
+    });
   }
   // Frozen Pink settings: endpoint plus the shared token.
   const pink = Object.freeze({url: pinkUrl.toString(), token: config.token});
@@ -84,7 +120,14 @@ export function loadTenantRoutes(env = process.env) {
     onboarding = Object.freeze({dids: Object.freeze([...dids]), url: url.toString(), token});
   }
   // Return everything the bridge needs for routing, frozen so it cannot be changed later.
-  return Object.freeze({config: Object.freeze(config), onboarding, trade, directTrade, pink, routeUrl: routeUrl.toString()});
+  return Object.freeze({
+    config: Object.freeze(config),
+    onboarding,
+    trade,
+    directTrade,
+    pink,
+    routeUrl: routeUrl.toString(),
+  });
 }
 
 // Reads the dialled number (DID) from the MEDIA_START event that Asterisk sends when a call begins.
@@ -95,7 +138,8 @@ export function didForMediaStart(event) {
   if (!variables || typeof variables !== 'object') throw new Error('Missing Asterisk route variable.');
   // The variable can arrive under any of three names; collect the value from each one that is present.
   const values = ['BMS_ROUTE_INFO', '_BMS_ROUTE_INFO', '__BMS_ROUTE_INFO']
-    .filter(key => Object.hasOwn(variables, key)).map(key => variables[key]);
+    .filter(key => Object.hasOwn(variables, key))
+    .map(key => variables[key]);
   // There must be at least one value, every value must be text, and all values must be identical.
   if (!values.length || values.some(value => typeof value !== 'string' || value !== values[0]))
     throw new Error('Missing or conflicting Asterisk route marker.');
@@ -113,13 +157,29 @@ export function configForDid(did, routes, brand) {
   // The DID must be 6-15 digits, with no spaces or "+".
   if (!/^\d{6,15}$/.test(did)) throw new Error('Use 6-15 DID digits without spaces or +.');
   // Onboarding numbers are decided locally from .env and always win.
-  if (routes.onboarding?.dids.includes(did)) return {mode: 'onboarding', url: routes.onboarding.url, token: routes.onboarding.token, did};
+  if (routes.onboarding?.dids.includes(did))
+    return {mode: 'onboarding', url: routes.onboarding.url, token: routes.onboarding.token, did};
   // Trade: shared Trade endpoint, with the DID sent as a routing header.
-  if (brand === 'trade') return {mode: 'trade', url: routes.trade.url, token: routes.trade.token, did, routingHeaders: {'X-BMSPro-DID': did}};
+  if (brand === 'trade')
+    return {
+      mode: 'trade',
+      url: routes.trade.url,
+      token: routes.trade.token,
+      did,
+      routingHeaders: {'X-BMSPro-DID': did},
+    };
   // Pink: Pink endpoint, with the DID sent as a routing header.
-  if (brand === 'pink') return {mode: 'pink', url: routes.pink.url, token: routes.pink.token, did, routingHeaders: {'X-BMSPro-DID': did}};
+  if (brand === 'pink')
+    return {
+      mode: 'pink',
+      url: routes.pink.url,
+      token: routes.pink.token,
+      did,
+      routingHeaders: {'X-BMSPro-DID': did},
+    };
   // Black: the shared workshop receptionist config.
-  if (brand === 'black') return {...routes.config, mode: 'receptionist', did, routingHeaders: {'X-BMSPro-DID': did}};
+  if (brand === 'black')
+    return {...routes.config, mode: 'receptionist', did, routingHeaders: {'X-BMSPro-DID': did}};
   // Any other brand means the backend did not identify the product.
   throw new Error('DID product has not been resolved by the backend.');
 }
@@ -140,42 +200,72 @@ export async function resolveConfigForDid(did, routes, fetcher = fetch) {
     try {
       // POST to Trade's discovery endpoint with the Trade secret and the DID.
       discovery = await fetcher(routes.directTrade.discoveryUrl, {
-        method: 'POST', headers: {Authorization: `Bearer ${routes.directTrade.token}`, 'X-BMSPro-DID': did},
+        method: 'POST',
+        headers: {Authorization: `Bearer ${routes.directTrade.token}`, 'X-BMSPro-DID': did},
         // Give up after 15 seconds, and refuse redirects.
-        signal: AbortSignal.timeout(15000), redirect: 'error',
+        signal: AbortSignal.timeout(15000),
+        redirect: 'error',
       });
-    // Network failure: remember it and carry on.
-    } catch { discoveryFailure = 'Trade DID discovery could not be reached.'; }
+      // Network failure: remember it and carry on.
+    } catch {
+      discoveryFailure = 'Trade DID discovery could not be reached.';
+    }
     // HTTP 403 means this Trade number or its business is turned off.
-    if (discovery?.status === 403) throw new Error('Trade DID or business is disabled. Check Trade dashboard DID mappings.');
+    if (discovery?.status === 403)
+      throw new Error('Trade DID or business is disabled. Check Trade dashboard DID mappings.');
     // A successful reply: read what Trade says about this number.
     if (discovery?.ok) {
       // Will hold Trade's JSON answer.
       let route;
       // Parse the JSON; stop if the body is not valid JSON.
-      try { route = await discovery.json(); } catch { throw new Error('Trade DID discovery response is invalid.'); }
+      try {
+        route = await discovery.json();
+      } catch {
+        throw new Error('Trade DID discovery response is invalid.');
+      }
       // The reply must be for the same DID and must say matched true/false.
-      if (route?.did !== did || typeof route?.matched !== 'boolean') throw new Error('Trade DID discovery response does not match the call.');
+      if (route?.did !== did || typeof route?.matched !== 'boolean')
+        throw new Error('Trade DID discovery response does not match the call.');
       // Trade owns this number.
       if (route.matched) {
         // Validate the business id: brand must be trade, id must be a clean string of at most 128 characters,
         // with no "/" and not "." or ".." (protects against path tricks).
-        if (route.brand !== 'trade' || typeof route.businessId !== 'string' || !route.businessId.trim() || route.businessId !== route.businessId.trim() ||
-            route.businessId.length > 128 || route.businessId.includes('/') || ['.', '..'].includes(route.businessId))
+        if (
+          route.brand !== 'trade' ||
+          typeof route.businessId !== 'string' ||
+          !route.businessId.trim() ||
+          route.businessId !== route.businessId.trim() ||
+          route.businessId.length > 128 ||
+          route.businessId.includes('/') ||
+          ['.', '..'].includes(route.businessId)
+        )
           throw new Error('Trade DID discovery returned an invalid business.');
         // Profile from discovery lets Sophie greet before the tool session is ready.
         const profile = route.profile && {
-          brand: 'trade', did, businessId: route.businessId,
-          businessName: route.profile.businessName, timezone: route.profile.timezone,
+          brand: 'trade',
+          did,
+          businessId: route.businessId,
+          businessName: route.profile.businessName,
+          timezone: route.profile.timezone,
         };
         // Return the direct Trade config pinned to this business. The shared backend (activityUrl/Token) is used for activity records.
-        return {mode: 'trade', url: routes.directTrade.url, token: routes.directTrade.token, did, businessId: route.businessId,
+        return {
+          mode: 'trade',
+          url: routes.directTrade.url,
+          token: routes.directTrade.token,
+          did,
+          businessId: route.businessId,
           ...(route.callback && {callback: route.callback}),
-          ...(typeof route.forwardingExtension === 'string' && {forwardingExtension: route.forwardingExtension}),
+          ...(typeof route.forwardingExtension === 'string' && {
+            forwardingExtension: route.forwardingExtension,
+          }),
           ...(profile && {discoveredProfile: profile}),
-          activityUrl: routes.config.url, activityToken: routes.config.token, routingHeaders: {'X-BMSPro-DID': did, 'X-BMSPro-Trade-Business': route.businessId}};
+          activityUrl: routes.config.url,
+          activityToken: routes.config.token,
+          routingHeaders: {'X-BMSPro-DID': did, 'X-BMSPro-Trade-Business': route.businessId},
+        };
       }
-    // Any other HTTP error from Trade: remember it for the error message.
+      // Any other HTTP error from Trade: remember it for the error message.
     } else if (discovery) discoveryFailure = `Trade DID discovery failed (HTTP ${discovery.status}).`;
   }
   // Fall back to the shared backend's routing lookup. Will hold its HTTP response.
@@ -189,19 +279,27 @@ export async function resolveConfigForDid(did, routes, fetcher = fetch) {
       signal: AbortSignal.timeout(12000),
       redirect: 'error',
     });
-  // Network failure reaching the backend.
-  } catch { throw new Error('Backend DID routing lookup failed.'); }
+    // Network failure reaching the backend.
+  } catch {
+    throw new Error('Backend DID routing lookup failed.');
+  }
   // Any non-success HTTP status from the backend is an error.
   if (!response.ok) throw new Error(`Backend DID routing lookup failed (HTTP ${response.status}).`);
   // Will hold the backend's JSON answer.
   let route;
   // Parse the JSON; stop if the body is not valid JSON.
-  try { route = await response.json(); } catch { throw new Error('Backend DID routing response is invalid.'); }
+  try {
+    route = await response.json();
+  } catch {
+    throw new Error('Backend DID routing response is invalid.');
+  }
   // The reply must be for the same DID and name a known product (black, trade or pink).
-  if (route?.did !== did || !['black', 'trade', 'pink'].includes(route?.brand)) throw new Error('Backend DID routing response does not match the call.');
+  if (route?.did !== did || !['black', 'trade', 'pink'].includes(route?.brand))
+    throw new Error('Backend DID routing response does not match the call.');
   // An outage, missing assignment or stale backend Trade route cannot bypass Trade's dashboard.
   // If direct Trade is configured, a Trade answer from the backend is not trusted; Trade's own mapping must allow it.
-  if (route.brand === 'trade' && routes.directTrade) throw new Error(discoveryFailure || 'This Trade DID must be enabled in Trade dashboard DID mappings.');
+  if (route.brand === 'trade' && routes.directTrade)
+    throw new Error(discoveryFailure || 'This Trade DID must be enabled in Trade dashboard DID mappings.');
   // Build the final call config for the product the backend named.
   return configForDid(did, routes, route.brand);
 }

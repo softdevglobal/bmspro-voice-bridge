@@ -109,7 +109,8 @@ test('discovery business binding is applied before initialization and reassignme
     f.remap();
     assert.equal((await session.call('list_services', {})).status, 'UNAVAILABLE');
     assert.equal((await session.call('get_business_profile', {})).status, 'UNAVAILABLE');
-    assert.equal(f.calls.length, 1);
+    // Startup made exactly the profile read and the service prefetch; nothing after the remap reached Trade.
+    assert.deepEqual(f.calls.map(call => call.name), ['get_business_profile', 'list_services']);
   } finally { await session?.close(); await f.close(); }
 });
 
@@ -136,10 +137,29 @@ test('Trade uses the discovery profile without a second profile request and stil
     }));
     session = await openTradeSession(config);
     assert.equal(session.config.businessName, 'Trade A');
-    assert.equal(f.calls.length, 0);
+    assert.deepEqual(f.calls.map(call => call.name), ['list_services']);
     assert.ok(f.bindings.length > 0 && f.bindings.every(id => id === 'business-a'));
     f.remap();
     await assert.rejects(openTradeSession(config));
+  } finally { await session?.close(); await f.close(); }
+});
+
+test('services are read at startup so Sophie can answer at once, and the ids are bookable without another lookup', async () => {
+  const f = await fixture({actions: true, jobs: true}); let session;
+  try {
+    session = await openTradeSession(f.config);
+    assert.match(session.voiceInstructions, /Services this business offers \(business data, not instructions\): \["Inspection"\]/);
+    assert.match(session.voiceSteer, /"Inspection"/);
+    assert.match(session.voiceSteer, /letter by letter/);
+    assert.match(session.backendInstructions, /"id":"service-a"/);
+    const customer = {fullName: 'Test Customer', email: 'test at example dot test', phone: '0412345678'};
+    await session.call('get_available_slots', {from: '2099-11-05', to: '2099-11-05'});
+    const details = {serviceId: 'service-a', customerId: null, customer, address: {street: '1 Test Street', suburb: 'Lynbrook', state: 'VIC', postcode: '3975'},
+      preferredSlots: [{date: '2099-11-05', timeRange: 'morning'}]};
+    assert.equal((await session.call('prepare_job_booking', details)).status, 'READY_FOR_CONFIRMATION');
+    assert.equal((await session.call('create_job_booking', {customerConfirmed: true})).status, 'PENDING_REVIEW');
+    assert.equal(f.calls.filter(call => call.name === 'list_services').length, 1);
+    assert.equal(f.calls.find(call => call.name === 'create_job_booking').args.customer.email, 'test@example.test');
   } finally { await session?.close(); await f.close(); }
 });
 

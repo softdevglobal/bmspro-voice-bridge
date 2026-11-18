@@ -14,10 +14,11 @@ import {END_CALL_TOOL, END_CALL_VOICE_RULE, END_CALL_BACKEND_RULE, createHangupC
 import {createVoiceStudioShadow} from '../asr/voice-studio-shadow.mjs'; // side by side seech to text test
 import {createCallTranscript} from '../observability/call-transcript.mjs'; // per-call transcript file writer
 import {createCallRecord, sendTradeCallRecord} from '../observability/call-record.mjs'; // call log saved to Trade (Firebase) after hang-up
-import {createOwnerVoiceHandler} from './owner-voice.mjs';
-import {createLiveListen} from './live-listen.mjs';
-import {loadOwnerHandoff, ownerHandoffReadiness, redirectToOwner} from './owner-handoff.mjs';
-import {createSophieCallback} from './sophie-callback.mjs';
+import {createOwnerVoiceHandler} from '../agents/trade/trade-owner-voice.mjs';
+import {createLiveListen} from '../agents/trade/trade-live-listen.mjs';
+import {loadOwnerHandoff, ownerHandoffReadiness, redirectToOwner} from '../agents/trade/trade-owner-handoff.mjs';
+import {createSophieCallback} from '../agents/trade/trade-sophie-callback.mjs';
+import {clearVoiceGuide} from '../agents/trade/trade-tools.mjs'; // clear, steady phone delivery for the greeting-first start
 
 const SCHEDULE_CUSTOMER_CALLBACK_TOOL = {
   type: 'function', name: 'schedule_customer_callback', strict: false,
@@ -663,6 +664,8 @@ wss.on('connection', media => {
           type: 'responses', responses: {tools: [...businessSession.tools, ...(outbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL] : []),
             ...(businessConfig.mode === 'trade' && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], tool_choice: 'auto', instructions: backendPrompt()},
         }}});
+        // The voice model started with a short holding prompt; give it the service list and email-spelling rules now.
+        if (businessSession.voiceSteer) steerVoice('trade_voice_guide', businessSession.voiceSteer);
       };
 
     // ---- Step 2: open the call-scoped MCP tool session for the matching mode ----     
@@ -743,7 +746,7 @@ wss.on('connection', media => {
           model: 'gpt-live-1', store: false,
           instructions: [
             greetFirst
-              ? `You are the receptionist for ${JSON.stringify(discoveredProfile.businessName)}. Greet and listen while Trade connects. If a caller asks for a booking, business lookup or transfer before the tools are ready, acknowledge their request briefly and retain what they said. Wait for the tool-ready instruction before delegating. Never invent business details or claim an action succeeded without a verified result.`
+              ? `You are the receptionist for ${JSON.stringify(discoveredProfile.businessName)}. Greet and listen while Trade connects. If a caller asks for a booking, business lookup or transfer before the tools are ready, acknowledge their request briefly and retain what they said. Wait for the tool-ready instruction before delegating. Never invent business details or claim an action succeeded without a verified result. ${clearVoiceGuide}`
               : businessSession.voiceInstructions ?? voiceInstructions(businessConfig),
             'Your name is Sophie. Identify yourself as Sophie, the AI assistant, in the opening greeting. For onboarding, you are Sophie from BMS Pro helping with business setup; do not ask the caller to choose an AI receptionist name.',
             outbound && !invoiceCall ? 'Ask if now is a good time. If they decline without asking for a callback, thank them and end the call. Keep customer information private on voicemail or with the wrong person.' : '',

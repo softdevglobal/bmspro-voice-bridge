@@ -1,3 +1,13 @@
+/**
+ * trade-owner-voice.mjs: lets the business OWNER talk to Sophie from the Trade dashboard (browser voice chat).
+ *
+ * This is not a phone call. The owner's browser creates a WebRTC offer (sdp) and sends it here. The
+ * bridge checks it, then forwards it to OpenAI's Realtime API using the bridge's own API key, and sends
+ * the answer back. The bridge only validates the request and the tool names (the tools are read-only
+ * owner reports; see toolNames below). The tool calls themselves are not made here.
+ *
+ * Flow: Trade dashboard -> POST here (Bearer secret) -> validate -> OpenAI /v1/realtime/calls -> SDP answer.
+ */
 import {timingSafeEqual} from 'node:crypto';
 
 // Read-only owner tools the Trade server may offer. The Trade server can send
@@ -28,12 +38,18 @@ const toolNames = new Set([
   'discard_knowledge_draft',
 ]);
 
+/** The tool list is valid only if every tool is a known function, with no repeats and none unknown. */
 function validTools(tools) {
-  return Array.isArray(tools) && tools.length > 0 && tools.length <= toolNames.size &&
+  return (
+    Array.isArray(tools) &&
+    tools.length > 0 &&
+    tools.length <= toolNames.size &&
     new Set(tools.map(tool => tool?.name)).size === tools.length &&
-    tools.every(tool => tool?.type === 'function' && toolNames.has(tool.name));
+    tools.every(tool => tool?.type === 'function' && toolNames.has(tool.name))
+  );
 }
 
+/** Constant-time check of "Authorization: Bearer <secret>"; a secret under 32 chars is never accepted. */
 function authorized(header, secret) {
   if (!secret || secret.length < 32) return false;
   const actual = Buffer.from(header ?? '');
@@ -41,6 +57,11 @@ function authorized(header, secret) {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
+/**
+ * Build the HTTP handler. Checks, in order: POST, bearer secret, JSON content type, body under 96 KB
+ * (read within 10 s), a valid SDP offer, a 64-hex safetyIdentifier, instructions under 4000 chars and an
+ * allowed tool list. Any failure returns a bare status code with no body. `fetcher` is replaceable in tests.
+ */
 export function createOwnerVoiceHandler({secret, apiKey, model = 'gpt-realtime-2.1', fetcher = fetch}) {
   return async (request, response) => {
     const fail = status => {
@@ -66,25 +87,37 @@ export function createOwnerVoiceHandler({secret, apiKey, model = 'gpt-realtime-2
       }
       clearTimeout(bodyTimer);
       let payload;
-      try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-      catch { return fail(400); }
+      try {
+        payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        return fail(400);
+      }
       const {sdp, session, safetyIdentifier} = payload ?? {};
-      if (typeof sdp !== 'string' || !/^v=0\r?\n/.test(sdp) || Buffer.byteLength(sdp) > 64 * 1024 ||
-          typeof safetyIdentifier !== 'string' || !/^[a-f0-9]{64}$/.test(safetyIdentifier) ||
-          typeof session?.instructions !== 'string' || session.instructions.length > 4000 ||
-          !validTools(session.tools)) {
+      if (
+        typeof sdp !== 'string' ||
+        !/^v=0\r?\n/.test(sdp) ||
+        Buffer.byteLength(sdp) > 64 * 1024 ||
+        typeof safetyIdentifier !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(safetyIdentifier) ||
+        typeof session?.instructions !== 'string' ||
+        session.instructions.length > 4000 ||
+        !validTools(session.tools)
+      ) {
         return fail(400);
       }
 
       const form = new FormData();
       form.set('sdp', sdp);
-      form.set('session', JSON.stringify({
-        type: 'realtime',
-        model,
-        audio: {output: {voice: 'shimmer'}},
-        instructions: session.instructions,
-        tools: session.tools,
-      }));
+      form.set(
+        'session',
+        JSON.stringify({
+          type: 'realtime',
+          model,
+          audio: {output: {voice: 'shimmer'}},
+          instructions: session.instructions,
+          tools: session.tools,
+        }),
+      );
       const upstream = await fetcher('https://api.openai.com/v1/realtime/calls', {
         method: 'POST',
         headers: {Authorization: `Bearer ${apiKey}`, 'OpenAI-Safety-Identifier': safetyIdentifier},

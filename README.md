@@ -63,7 +63,7 @@ and set `AI_OWNER_VOICE_BRIDGE_URL=http://127.0.0.1:18787` in Trade.
 ### Sophie outbound callback pilot
 
 For automatic callbacks, deploy the updated Trade app and bridge
-`src/server/sophie-callback.mjs` and `src/routing/tenant-routing.mjs`. Keep the
+`src/agents/trade/trade-sophie-callback.mjs` and `src/routing/tenant-routing.mjs`. Keep the
 callback flag and AMI credentials below. In **Super Admin → DID mappings**,
 enable callbacks and automatic callbacks for each DID, and save its approved
 outbound caller ID and Yeastar dial prefix. Those mappings supply the dial

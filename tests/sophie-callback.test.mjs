@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
 import test from 'node:test';
-import {originate} from '../src/server/sophie-callback.mjs';
+import {originate} from '../src/agents/trade/trade-sophie-callback.mjs';
 
 test('AMI queue acknowledgement is distinct from the callback result', async () => {
   const socket = new EventEmitter();

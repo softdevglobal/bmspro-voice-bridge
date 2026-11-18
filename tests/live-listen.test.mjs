@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import http from 'node:http';
 import test from 'node:test';
-import {createLiveListen} from '../src/server/live-listen.mjs';
+import {createLiveListen} from '../src/agents/trade/trade-live-listen.mjs';
 
 test('live audio is restricted to the answered call’s business and stops at hangup', async () => {
   const secret = 'trade-live-listen-test-secret-00000000';
