@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
 import test from 'node:test';
-import {ownerHandoffReadiness, redirectToOwner} from '../src/server/owner-handoff.mjs';
+import {ownerHandoffReadiness, redirectToOwner} from '../src/agents/trade/trade-owner-handoff.mjs';
 
 const config = {username: 'handoff-test', secret: 'fixture-secret'};
 const route = {mode: 'trade', did: '0359111403', businessId: 'nira', forwardingExtension: '3101'};

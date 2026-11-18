@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createTradeActionPolicy} from '../src/agents/trade/trade-action-policy.mjs';
+import {createTradeActionPolicy, writtenEmail} from '../src/agents/trade/trade-action-policy.mjs';
 
 const names = ['get_business_profile', 'list_services', 'find_customer', 'get_available_slots', 'register_customer', 'create_inspection_request'];
 const customer = {fullName: 'Test Customer', email: 'test@example.test', phone: '0412345678'};
@@ -169,4 +169,26 @@ test('Trade tool timeouts: knowledge fails fast, other reads in 20 s, writes kee
   assert.equal(toolTimeoutMs('list_services'), 20000);
   for (const name of ['create_inspection_request', 'create_job_booking', 'register_customer', 'reschedule_job', 'cancel_job'])
     assert.equal(toolTimeoutMs(name), 40000);
+});
+
+test('spoken or spelled emails are written out, and anything else stays as said', () => {
+  assert.equal(writtenEmail('john dot smith at gmail dot com'), 'john.smith@gmail.com');
+  assert.equal(writtenEmail('J O H N underscore 7 at outlook dot com dot au'), 'john_7@outlook.com.au');
+  assert.equal(writtenEmail('mary-ann@example.com.'), 'mary-ann@example.com');
+  assert.equal(writtenEmail('matt@at.com'), 'matt@at.com');
+  assert.equal(writtenEmail('dorothy at at dot com'), 'dorothyatat.com'); // "at" twice: not guessed, so still invalid
+});
+test('an unusable email gets a targeted, letter-by-letter spelling request', async () => {
+  const {policy, calls} = fixture(); await ready(policy);
+  const result = await policy.call('create_inspection_request', {...booking, customer: {...customer, email: 'test at example'}});
+  assert.equal(result.code, 'INVALID_CUSTOMER_DETAILS');
+  assert.deepEqual(result.invalidFields, ['email']);
+  assert.match(result.message, /letter by letter/);
+  const lookup = await policy.call('find_customer', {email: 'not an email', phone: customer.phone});
+  assert.deepEqual(lookup.invalidFields, ['email']);
+  assert.match(lookup.message, /spell/);
+  assert.equal(calls.some(call => ['create_inspection_request', 'find_customer'].includes(call.name)), false);
+  const spoken = await policy.call('find_customer', {email: 'test at example dot test', phone: customer.phone});
+  assert.equal(spoken.status, 'MATCHED');
+  assert.equal(calls.find(call => call.name === 'find_customer').args.email, 'test@example.test');
 });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import test from 'node:test';
-import {createOwnerVoiceHandler} from '../src/server/owner-voice.mjs';
+import {createOwnerVoiceHandler} from '../src/agents/trade/trade-owner-voice.mjs';
 
 test('owner voice setup requires the Trade bridge secret and uses the bridge OpenAI key', async (t) => {
   const secret = 'trade-bridge-test-secret-0000000000000000';
