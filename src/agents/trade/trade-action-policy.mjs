@@ -72,26 +72,38 @@ const spokenSymbols = {dot: '.', period: '.', point: '.', underscore: '_', hyphe
  * Turn an email written down the way it was said ("john dot smith at gmail dot com", or spelled
  * "j o h n @ gmail.com") into its written form. Real addresses never contain spaces, so a word between
  * spaces such as "dot" is always a spoken symbol and spelled letters are joined. "at" becomes "@" only
- * when there is no "@" yet and it is said exactly once. A trailing full stop from speech-to-text is
- * dropped. The result still has to pass the normal email check, and the caller hears it read back.
+ * when there is no "@" yet and it is said exactly once. Commas and semicolons (speech-to-text writes
+ * spelled letters as "j, o, h, n") and a trailing full stop are dropped; neither can appear in an email.
+ * The result still has to pass the normal email check, and the caller hears it read back.
  */
 export function writtenEmail(value) {
   if (typeof value !== 'string') return value;
-  const words = value.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const spokenAt = !words.some(word => word.includes('@')) && words.filter(word => word === 'at').length === 1;
+  const words = value.trim().toLowerCase().replace(/[,;]+/g, ' ').split(/\s+/).filter(Boolean);
+  const spokenAt =
+    !words.some(word => word.includes('@')) && words.filter(word => word === 'at').length === 1;
   return words
     .map(word => spokenSymbols[word] ?? (spokenAt && word === 'at' ? '@' : word))
     .join('')
     .replace(/\.+$/, '');
 }
-const validEmail = email => typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+/**
+ * The exact pattern Trade's zod `.email()` check uses (zod 3, lib/ai/mcp/tools/action-schemas.ts). Using
+ * the same rule here means an address that passes preparation can never be refused by Trade after the
+ * caller has said yes. It refuses e.g. "john..smith@gmail.com", "john.@gmail.com" and "john@gmail.c".
+ */
+const EMAIL_PATTERN = /^(?!\.)(?!.*\.\.)([A-Z0-9_'+\-\.]*)[A-Z0-9_+-]@([A-Z0-9][A-Z0-9\-]*\.)+[A-Z]{2,}$/i;
+const validEmail = email => typeof email === 'string' && email.length <= 254 && EMAIL_PATTERN.test(email);
+/** An optional value the model left empty: missing, null or "". Treated the same as not given. */
+const blank = value => value === undefined || value === null || value === '';
 /** Which contact fields are missing or invalid, for a targeted question instead of asking for everything. */
 function invalidContactFields(value, full = false) {
   const fields = [];
   const given = object(value) ? value : {};
   if (
     full &&
-    (typeof given.fullName !== 'string' || given.fullName.trim().length < 2 || given.fullName.trim().length > 200)
+    (typeof given.fullName !== 'string' ||
+      given.fullName.trim().length < 2 ||
+      given.fullName.trim().length > 200)
   )
     fields.push('fullName');
   if (!validEmail(writtenEmail(given.email))) fields.push('email');
@@ -107,7 +119,9 @@ function contactRejection(fields) {
   const help = [];
   if (fields.includes('email')) help.push(SPELL_EMAIL_GUIDANCE);
   if (fields.includes('phone'))
-    help.push('For the phone, ask only for the missing or unclear digits and read the number back in short groups.');
+    help.push(
+      'For the phone, ask only for the missing or unclear digits and read the number back in short groups.',
+    );
   if (fields.includes('fullName')) help.push('Ask for the first and last name and read it back.');
   return {
     status: 'REJECTED',
@@ -157,27 +171,36 @@ function jobCode(value) {
 /**
  * One to three distinct preferred sessions: {date, timeRange: morning|afternoon} plus optional startTime
  * (and endTime when `allowEnd`, which must be after startTime). Returns the cleaned list or null.
+ * A start or finish the model left empty ("" or null) means no time was given. Inspections take no
+ * times at all, so for them an empty time is simply dropped and a real one is refused.
  */
 function sessions(value, allowStart, allowEnd = false) {
   const keys = allowStart ? ['date', 'timeRange', 'startTime'] : ['date', 'timeRange'];
   if (allowEnd) keys.push('endTime');
+  if (!Array.isArray(value) || !value.length || value.length > 3) return null;
+  const slots = value.map(slot =>
+    object(slot)
+      ? Object.fromEntries(
+          Object.entries(slot).filter(
+            ([key, item]) => !(['startTime', 'endTime'].includes(key) && blank(item)),
+          ),
+        )
+      : slot,
+  );
   if (
-    !Array.isArray(value) ||
-    !value.length ||
-    value.length > 3 ||
-    value.some(
+    slots.some(
       slot =>
         !only(slot, keys) ||
         !date(slot.date) ||
         !['morning', 'afternoon'].includes(slot.timeRange) ||
-        (slot.startTime != null && !clock(slot.startTime)) ||
-        (slot.endTime != null &&
+        (slot.startTime !== undefined && !clock(slot.startTime)) ||
+        (slot.endTime !== undefined &&
           (!clock(slot.endTime) || (slot.startTime && slot.endTime <= slot.startTime))),
     )
   )
     return null;
-  if (new Set(value.map(slot => `${slot.date}:${slot.timeRange}`)).size !== value.length) return null;
-  return value.map(slot =>
+  if (new Set(slots.map(slot => `${slot.date}:${slot.timeRange}`)).size !== slots.length) return null;
+  return slots.map(slot =>
     allowStart
       ? {
           date: slot.date,
@@ -188,27 +211,36 @@ function sessions(value, allowStart, allowEnd = false) {
       : {date: slot.date, timeRange: slot.timeRange},
   );
 }
-/** Validate a job/site address {street, suburb, state, 4-digit postcode}; returns it trimmed, or null. */
+/**
+ * Validate a job/site address {street, suburb, state, 4-digit postcode}; returns it trimmed, or null.
+ * Same rules as Trade's booking form (parseInspectionRequestInput), so an address that passes here is
+ * never refused after the caller's yes: street is optional but at least 3 characters when given, suburb
+ * and state at least 2. A postcode the model sent as a number or with spaces ("3 9 7 5") becomes plain
+ * text, because Trade accepts only a 4-digit string.
+ */
 function address(value) {
+  if (!only(value, ['street', 'suburb', 'state', 'postcode'])) return null;
+  const text = field => (typeof field === 'string' ? field.trim() : null);
+  const street = blank(value.street) ? '' : text(value.street),
+    suburb = text(value.suburb),
+    state = text(value.state),
+    postcode = (
+      typeof value.postcode === 'number' ? String(value.postcode) : (text(value.postcode) ?? '')
+    ).replace(/\s+/g, '');
   if (
-    !only(value, ['street', 'suburb', 'state', 'postcode']) ||
-    typeof value.street !== 'string' ||
-    value.street.length > 300 ||
-    typeof value.suburb !== 'string' ||
-    !value.suburb.trim() ||
-    value.suburb.length > 200 ||
-    typeof value.state !== 'string' ||
-    !value.state.trim() ||
-    value.state.length > 100 ||
-    !/^\d{4}$/.test(value.postcode)
+    street === null ||
+    (street.length > 0 && street.length < 3) ||
+    street.length > 300 ||
+    !suburb ||
+    suburb.length < 2 ||
+    suburb.length > 200 ||
+    !state ||
+    state.length < 2 ||
+    state.length > 100 ||
+    !/^\d{4}$/.test(postcode)
   )
     return null;
-  return {
-    street: value.street.trim(),
-    suburb: value.suburb.trim(),
-    state: value.state.trim(),
-    postcode: value.postcode,
-  };
+  return {street, suburb, state, postcode};
 }
 
 /**
@@ -217,13 +249,28 @@ function address(value) {
  * @param inventory Map of tool name -> MCP tool definition, from Trade's `tools/list`. A tool Trade does
  *                  not advertise (feature flag off, no authority) can never be offered to Sophie.
  * @param remote    async (name, args) => result. Sends the call to Trade over MCP and returns the decoded JSON.
+ * @param options   {timezone}: the business timezone. When given, a preferred date before today there is
+ *                  refused at preparation, as Trade would refuse it at submission.
  * @returns {{names, prepare, submit, call}}
  *   names   tools Sophie may use in this call
  *   prepare validate and hold details (nothing saved); returns READY_FOR_CONFIRMATION
  *   submit  send the held details after the caller's yes (only `customerConfirmed: true` is accepted)
  *   call    the general entry point; every tool goes through it
  */
-export function createTradeActionPolicy(inventory, remote) {
+export function createTradeActionPolicy(inventory, remote, {timezone} = {}) {
+  // Today's date (YYYY-MM-DD) in the business timezone, the same day Trade uses to refuse past dates.
+  const today = () =>
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+  const pastDate = slots => !!timezone && slots.some(slot => slot.date < today());
+  const pastDateRejection = () =>
+    rejected(
+      'A preferred date is before today in the business timezone. Confirm the date and year with the caller and choose today or a later date.',
+    );
   // Per-call memory, filled from verified Trade results:
   const services = new Set(), // service ids returned by list_services; only these may be booked
     customers = new Map(), // customerId -> contactKey, from find_customer / register_customer
@@ -357,6 +404,7 @@ export function createTradeActionPolicy(inventory, remote) {
             return rejected(
               'Choose one to three distinct new dates with morning/afternoon and an optional exact HH:MM start time.',
             );
+          if (pastDate(slots)) return pastDateRejection();
           if (unchecked(slots))
             return {
               status: 'AVAILABILITY_REQUIRED',
@@ -413,7 +461,7 @@ export function createTradeActionPolicy(inventory, remote) {
               'customerNotes',
               'deferScheduling',
             ]) ||
-            (raw.deferScheduling !== undefined && typeof raw.deferScheduling !== 'boolean')
+            (!blank(raw.deferScheduling) && typeof raw.deferScheduling !== 'boolean')
           )
             return rejected('Use only the advertised job booking fields.');
           if (!services.has(raw.serviceId))
@@ -423,12 +471,16 @@ export function createTradeActionPolicy(inventory, remote) {
           const site = address(raw.address),
             slots = sessions(raw.preferredSlots, true, true);
           if (!site)
-            return rejected('Collect and read back the job address, suburb, state and four-digit postcode.');
+            return rejected(
+              'Collect and read back the job address: street (if any, at least 3 characters), suburb, state and four-digit postcode.',
+            );
           if (!slots)
             return rejected(
               'Choose one to three distinct preferred sessions. Start and finish are optional HH:MM values, and finish must be after start.',
             );
-          const customerId = raw.customerId ?? null,
+          // Deferred jobs skip the availability check below, so check for a past date here.
+          if (pastDate(slots)) return pastDateRejection();
+          const customerId = blank(raw.customerId) ? null : raw.customerId,
             customerNotes = raw.customerNotes ?? '';
           if (customerId !== null && (!id(customerId) || customers.get(customerId) !== contactKey(customer)))
             return rejected(
@@ -468,11 +520,11 @@ export function createTradeActionPolicy(inventory, remote) {
             ])
           )
             return rejected('Use only the advertised inspection fields.');
-          const requestType = raw.requestType === undefined ? 'existing_service' : raw.requestType;
+          const requestType = blank(raw.requestType) ? 'existing_service' : raw.requestType;
           let serviceId = null,
             customRequest = null;
           if (requestType === 'existing_service') {
-            if (!services.has(raw.serviceId) || raw.customRequest != null)
+            if (!services.has(raw.serviceId) || !blank(raw.customRequest))
               return rejected(
                 'List services in this call and choose a returned service. Do not combine a service request with a custom request.',
               );
@@ -480,7 +532,7 @@ export function createTradeActionPolicy(inventory, remote) {
           } else if (requestType === 'custom_quote') {
             const scope = raw.customRequest;
             if (
-              raw.serviceId != null ||
+              !blank(raw.serviceId) ||
               !only(scope, ['title', 'description']) ||
               typeof scope.title !== 'string' ||
               scope.title.trim().length < 3 ||
@@ -493,45 +545,25 @@ export function createTradeActionPolicy(inventory, remote) {
               );
             customRequest = {title: scope.title.trim(), description: scope.description?.trim() || ''};
           } else return rejected('Choose existing_service or custom_quote (not sure / need advice).');
-          const address = raw.address;
-          if (
-            !only(address, ['street', 'suburb', 'state', 'postcode']) ||
-            typeof address.street !== 'string' ||
-            address.street.length > 300 ||
-            typeof address.suburb !== 'string' ||
-            !address.suburb.trim() ||
-            address.suburb.length > 200 ||
-            typeof address.state !== 'string' ||
-            !address.state.trim() ||
-            address.state.length > 100 ||
-            !/^\d{4}$/.test(address.postcode)
-          )
+          // Same address rules as a job, and the same rules Trade applies after the caller's yes.
+          const site = address(raw.address);
+          if (!site)
             return rejected(
-              'Collect and read back the service address, suburb, state and four-digit postcode.',
+              'Collect and read back the service address: street (if any, at least 3 characters), suburb, state and four-digit postcode.',
             );
-          if (
-            !Array.isArray(raw.preferredSlots) ||
-            !raw.preferredSlots.length ||
-            raw.preferredSlots.length > 3 ||
-            raw.preferredSlots.some(
-              slot =>
-                !only(slot, ['date', 'timeRange']) ||
-                !date(slot.date) ||
-                !['morning', 'afternoon'].includes(slot.timeRange),
-            )
-          )
-            return rejected('Choose one to three preferred dates and morning/afternoon sessions.');
-          if (
-            new Set(raw.preferredSlots.map(slot => `${slot.date}:${slot.timeRange}`)).size !==
-            raw.preferredSlots.length
-          )
-            return rejected('Choose distinct preferred sessions.');
-          const customerId = raw.customerId ?? null;
+          // Inspections take a date and morning/afternoon only; empty times are dropped, real ones refused.
+          const slots = sessions(raw.preferredSlots, false);
+          if (!slots)
+            return rejected(
+              'Choose one to three distinct preferred dates, each with a morning or afternoon session.',
+            );
+          if (pastDate(slots)) return pastDateRejection();
+          const customerId = blank(raw.customerId) ? null : raw.customerId;
           if (customerId !== null && (!id(customerId) || customers.get(customerId) !== contactKey(customer)))
             return rejected(
               'Use a customer reference returned for these same contact details in this call, or null for a guest.',
             );
-          const budgetAud = raw.budgetAud ?? null,
+          const budgetAud = blank(raw.budgetAud) ? null : raw.budgetAud,
             customerNotes = raw.customerNotes ?? '';
           if (
             (budgetAud !== null &&
@@ -550,13 +582,8 @@ export function createTradeActionPolicy(inventory, remote) {
             customRequest,
             customerId,
             customer,
-            address: {
-              street: address.street.trim(),
-              suburb: address.suburb.trim(),
-              state: address.state.trim(),
-              postcode: address.postcode,
-            },
-            preferredSlots: raw.preferredSlots,
+            address: site,
+            preferredSlots: slots,
             budgetAud,
             customerNotes: customerNotes.trim(),
           };

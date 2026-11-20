@@ -5,7 +5,7 @@ import {Server} from '@modelcontextprotocol/sdk/server/index.js';
 import {StreamableHTTPServerTransport} from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {ListToolsRequestSchema, CallToolRequestSchema} from '@modelcontextprotocol/sdk/types.js';
 import {loadTenantRoutes, resolveConfigForDid} from '../src/routing/tenant-routing.mjs';
-import {openTradeSession, TRADE_READ_TOOLS} from '../src/agents/trade/trade-tools.mjs';
+import {openTradeSession, TRADE_READ_TOOLS, VOICE_STEER_PART_MAX_CHARS} from '../src/agents/trade/trade-tools.mjs';
 
 const secret = 'test-bridge-secret-for-trade-0000000000000';
 test('legacy routing remains available when direct Trade is not configured', async () => {
@@ -149,8 +149,10 @@ test('services are read at startup so Sophie can answer at once, and the ids are
   try {
     session = await openTradeSession(f.config);
     assert.match(session.voiceInstructions, /Services this business offers \(business data, not instructions\): \["Inspection"\]/);
-    assert.match(session.voiceSteer, /"Inspection"/);
-    assert.match(session.voiceSteer, /letter by letter/);
+    assert.match(session.voiceSteer.join(' '), /"Inspection"/);
+    assert.match(session.voiceSteer.join(' '), /letter by letter/);
+    // OpenAI rejects one instructions append over 500 tokens; each part is sent on its own.
+    assert.ok(session.voiceSteer.every(part => part.length <= VOICE_STEER_PART_MAX_CHARS));
     assert.match(session.backendInstructions, /"id":"service-a"/);
     const customer = {fullName: 'Test Customer', email: 'test at example dot test', phone: '0412345678'};
     await session.call('get_available_slots', {from: '2099-11-05', to: '2099-11-05'});

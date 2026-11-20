@@ -69,12 +69,18 @@ test('owner voice accepts any known read-only tools, but not unknown or repeated
   assert.equal((await start(['get_daily_summary', 'get_day_activity', 'get_staff_day_report',
     'list_jobs_awaiting_scheduling', 'get_staff_working_today', 'search_business_knowledge',
     'prepare_knowledge_draft', 'save_knowledge_draft', 'discard_knowledge_draft'])).status, 200);
-  assert.equal(upstream.mock.callCount(), 4);
+  // Trade with voice services enabled adds the two owner MCP service tools.
+  assert.equal((await start(['get_daily_summary', 'get_day_activity', 'get_staff_day_report',
+    'list_jobs_awaiting_scheduling', 'get_staff_working_today', 'prepare_service', 'create_service'])).status, 200);
+  // Trade with voice customers enabled adds the four browser-side customer tools.
+  assert.equal((await start(['get_daily_summary', 'list_customers', 'open_add_customer_form',
+    'open_edit_customer_form', 'customer_form_step'])).status, 200);
+  assert.equal(upstream.mock.callCount(), 6);
 
   assert.equal((await start(['get_daily_summary', 'create_job'])).status, 400, 'unknown tool');
   assert.equal((await start(['get_daily_summary', 'search_knowledge'])).status, 400, 'unknown knowledge tool name');
   assert.equal((await start(['get_daily_summary', 'publish_knowledge'])).status, 400, 'no publish tool');
   assert.equal((await start(['get_daily_summary', 'get_daily_summary'])).status, 400, 'repeated tool');
   assert.equal((await start([])).status, 400, 'no tools');
-  assert.equal(upstream.mock.callCount(), 4);
+  assert.equal(upstream.mock.callCount(), 6);
 });
