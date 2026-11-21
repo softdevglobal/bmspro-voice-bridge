@@ -192,3 +192,53 @@ test('an unusable email gets a targeted, letter-by-letter spelling request', asy
   assert.equal(spoken.status, 'MATCHED');
   assert.equal(calls.find(call => call.name === 'find_customer').args.email, 'test@example.test');
 });
+test('emails Trade would refuse are caught at preparation, and spelled letters with commas are joined', async () => {
+  assert.equal(writtenEmail('j, o, h, n, dot, s, m, i, t, h at gmail dot com'), 'john.smith@gmail.com');
+  const {policy} = fixture(); await ready(policy);
+  const {customerConfirmed: _confirmation, ...details} = booking;
+  for (const email of ['john..smith@gmail.com', 'john.@gmail.com', 'john@gmail.c', 'josé@gmail.com', 'john@-gmail.com']) {
+    const result = await policy.prepare({...details, customer: {...customer, email}});
+    assert.deepEqual(result.invalidFields, ['email'], email);
+  }
+  assert.equal((await policy.prepare({...details, customer: {...customer, email: "o'brien+jobs@mail.example.com.au"}})).status, 'READY_FOR_CONFIRMATION');
+});
+test('empty optional values mean "not given", and addresses follow Trade\'s booking-form rules', async () => {
+  const {policy, calls} = fixture(); await ready(policy);
+  const {customerConfirmed: _confirmation, ...details} = booking;
+  const held = await policy.prepare({...details, customerId: '', budgetAud: '', customRequest: '', requestType: '',
+    preferredSlots: [{date: '2099-11-05', timeRange: 'morning', startTime: null, endTime: ''}], address: {...booking.address, postcode: 3975}});
+  assert.equal(held.status, 'READY_FOR_CONFIRMATION');
+  assert.deepEqual(held.summary.preferredSlots, [{date: '2099-11-05', timeRange: 'morning'}]);
+  assert.equal(held.summary.address.postcode, '3975');
+  assert.equal(held.summary.customerId, null); assert.equal(held.summary.budgetAud, null);
+  // A real time on an inspection is still refused rather than silently dropped.
+  assert.equal((await policy.prepare({...details, preferredSlots: [{date: '2099-11-05', timeRange: 'morning', startTime: '09:00'}]})).status, 'REJECTED');
+  // Address parts Trade would refuse after the caller's yes are refused now instead.
+  for (const bad of [{street: '12'}, {suburb: 'L'}, {state: 'V'}, {postcode: '397'}, {postcode: 397}])
+    assert.equal((await policy.prepare({...details, address: {...booking.address, ...bad}})).status, 'REJECTED', JSON.stringify(bad));
+  const noStreet = await policy.prepare({...details, address: {...booking.address, street: '', postcode: '3 9 7 5'}});
+  assert.deepEqual(noStreet.summary.address, {street: '', suburb: 'Lynbrook', state: 'VIC', postcode: '3975'});
+  // Advice with an empty service reference is still advice.
+  const advice = await policy.prepare({...details, serviceId: '', requestType: 'custom_quote', customRequest: {title: 'Leaking roof'}});
+  assert.equal(advice.status, 'READY_FOR_CONFIRMATION');
+  assert.equal(calls.some(call => call.name === 'create_inspection_request'), false);
+});
+test('a past preferred date is refused at preparation when the business timezone is known', async () => {
+  const calls = [];
+  const policy = createTradeActionPolicy(new Map([...names, 'create_job_booking'].map(name => [name, {}])), async (name, args) => {
+    calls.push({name, args});
+    if (name === 'list_services') return [{id: 'service-a', name: 'Inspection'}];
+    if (name === 'get_available_slots') return {brand: 'trade', ...args, unavailable: []};
+    return {status: 'PENDING_REVIEW', requestId: 'request-a'};
+  }, {timezone: 'Australia/Melbourne'});
+  await policy.call('list_services', {});
+  const {customerConfirmed: _confirmation, ...details} = booking;
+  const past = [{date: '2020-01-06', timeRange: 'morning'}];
+  // A deferred job skips the availability check, so only this date check stops it before the caller's yes.
+  const deferred = {serviceId: 'service-a', customerId: null, customer, address: booking.address, preferredSlots: past, deferScheduling: true};
+  const job = await policy.prepare(deferred, 'create_job_booking');
+  assert.equal(job.status, 'REJECTED'); assert.match(job.message, /before today/);
+  assert.match((await policy.prepare({...details, preferredSlots: past})).message, /before today/);
+  assert.equal((await policy.prepare({...deferred, preferredSlots: [{date: '2099-11-05', timeRange: 'morning'}]}, 'create_job_booking')).status, 'READY_FOR_CONFIRMATION');
+  assert.equal(calls.some(call => call.name === 'create_job_booking'), false);
+});

@@ -3,14 +3,15 @@
  *
  * This is not a phone call. The owner's browser creates a WebRTC offer (sdp) and sends it here. The
  * bridge checks it, then forwards it to OpenAI's Realtime API using the bridge's own API key, and sends
- * the answer back. The bridge only validates the request and the tool names (the tools are read-only
- * owner reports; see toolNames below). The tool calls themselves are not made here.
+ * the answer back. The bridge only validates the request and the tool names (mostly read-only owner
+ * reports, plus owner-confirmed knowledge drafts and services; see toolNames below). The tool calls
+ * themselves are not made here.
  *
  * Flow: Trade dashboard -> POST here (Bearer secret) -> validate -> OpenAI /v1/realtime/calls -> SDP answer.
  */
 import {timingSafeEqual} from 'node:crypto';
 
-// Read-only owner tools the Trade server may offer. The Trade server can send
+// Owner tools the Trade server may offer. The Trade server can send
 // any of them (so the bridge and Trade can be deployed in either order), but
 // never an unknown or repeated tool.
 const toolNames = new Set([
@@ -36,6 +37,81 @@ const toolNames = new Set([
   'prepare_knowledge_draft',
   'save_knowledge_draft',
   'discard_knowledge_draft',
+  // Voice service creation, offered only when Trade enables it. These run on Trade's
+  // owner MCP route, never here: prepare_service stores a draft and creates nothing, and
+  // create_service creates a live service only from that stored draft after the owner says yes.
+  'prepare_service',
+  'create_service',
+  // Browser-only service form helpers, offered with the service tools. They run in the
+  // owner's browser: open the Add service popup, then pick an existing template or custom.
+  'open_add_service_form',
+  'choose_service_source',
+  'service_form_step',
+  // Browser-only: open an existing service in the Edit popup, and delete one through the
+  // Services page's own confirm dialog after the owner says yes. Both use Trade's normal owner API.
+  'open_edit_service_form',
+  'delete_service',
+  // Browser-only and read only: lists the owner's services (name, duration, live, step count).
+  'list_services',
+  // Team voice tools, offered only when Trade enables them. Browser-only: they drive the Team
+  // pages (staff, leave requests, attendance) and use Trade's normal owner APIs. Changes need a
+  // read-back and a clear yes; attendance is read only.
+  'list_staff',
+  'open_staff_form',
+  'staff_form_step',
+  'manage_staff_member',
+  'list_leave_requests',
+  'decide_leave_request',
+  'show_attendance',
+  // Customer voice tools, offered only when Trade enables them. Browser-only: they drive the Customers
+  // page (search, Add / Edit customer popup) and use Trade's normal owner API. A save needs a read-back and a yes.
+  'list_customers',
+  'open_add_customer_form',
+  'open_edit_customer_form',
+  'customer_form_step',
+  // MCP twins (Trade AI_OWNER_VOICE_TOOL_MODE=mcp): get_customers reads; prepare_* store one pending change.
+  'get_customers',
+  'prepare_customer_create',
+  'prepare_customer_update',
+  // Browser-only AI knowledge tools (Trade knowledge write flag, browser mode): list entries, open one
+  // in the AI knowledge page's editor, edit and save it, publish / unpublish / delete. Changes need a yes.
+  'list_knowledge',
+  'open_knowledge_entry',
+  'knowledge_form_step',
+  'manage_knowledge_entry',
+  // MCP twins of the browser tools above (Trade AI_OWNER_VOICE_TOOL_MODE=mcp). They run on Trade's
+  // owner MCP route: get_* read, prepare_* store one pending change and change nothing, and
+  // confirm_owner_change applies it only after the owner's yes.
+  'get_services',
+  'prepare_service_update',
+  'prepare_service_delete',
+  'get_staff',
+  'prepare_staff_create',
+  'prepare_staff_update',
+  'prepare_staff_status',
+  'prepare_staff_delete',
+  'get_leave_requests',
+  'prepare_leave_decision',
+  'get_attendance',
+  'prepare_knowledge_entry',
+  'get_knowledge_entries',
+  'prepare_knowledge_update',
+  'prepare_knowledge_publish',
+  'prepare_knowledge_delete',
+  'confirm_owner_change',
+  'cancel_owner_change',
+  // Item list (catalog items used in quotations), offered only when Trade enables it. Browser tools
+  // drive the Item list page; the MCP twins (get_items, prepare_item_*) run on Trade's owner MCP route.
+  // Saving or deleting needs a read-back (prices as dollars and cents) and a yes.
+  'list_items',
+  'open_add_item_form',
+  'open_edit_item_form',
+  'item_form_step',
+  'delete_item',
+  'get_items',
+  'prepare_item_create',
+  'prepare_item_update',
+  'prepare_item_delete',
 ]);
 
 /** The tool list is valid only if every tool is a known function, with no repeats and none unknown. */

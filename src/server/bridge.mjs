@@ -347,6 +347,14 @@ wss.on('connection', media => {
     live.on('error', error => {
       // Avoid dumping SDK errors that can include credentials or caller content.
       const detail = error?.error?.error ?? error?.error ?? error;
+      // Expected when the call has already ended: logged once, in the event handler below.
+      if (closing && detail?.code === 'context_injection_incomplete') return;
+      // The voice guide is optional extra wording (service list, email spelling). If OpenAI rejects it,
+      // the tools still work, so keep the caller on the line instead of hanging up.
+      if (!closing && String(detail?.client_event_id ?? '').startsWith('trade_voice_guide_')) {
+        log(`Voice guide not delivered; call continues: code=${safeCode(detail?.code)} clientEvent=${safeCode(String(detail.client_event_id).replace(`_${callId}`, ''))}`);
+        return;
+      }
       log(`OpenAI error; code=${safeCode(detail?.code)} type=${safeCode(detail?.type)} param=${safeCode(detail?.param)} clientEvent=${safeCode(detail?.client_event_id)} message=${safeDiagnostic(detail?.message)}`);
       finish('OpenAI error; check model access, billing and server configuration');
     });
@@ -665,7 +673,9 @@ wss.on('connection', media => {
             ...(businessConfig.mode === 'trade' && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], tool_choice: 'auto', instructions: backendPrompt()},
         }}});
         // The voice model started with a short holding prompt; give it the service list and email-spelling rules now.
-        if (businessSession.voiceSteer) steerVoice('trade_voice_guide', businessSession.voiceSteer);
+        // Sent in parts: OpenAI rejects a single instructions append over 500 tokens.
+        [].concat(businessSession.voiceSteer ?? []).forEach((content, index) =>
+          steerVoice(`trade_voice_guide_${index + 1}`, content));
       };
 
     // ---- Step 2: open the call-scoped MCP tool session for the matching mode ----     
@@ -795,6 +805,12 @@ wss.on('connection', media => {
           }
         }
         if (event.type === 'error') {
+          // The call ended while an instruction (greeting, tools-ready, ...) was still being loaded.
+          // Nobody is left to hear it, so this is not a failure: one short line instead of three errors.
+          if (closing && event.error?.code === 'context_injection_incomplete') {
+            log(`Call had already ended; instruction not delivered: ${safeCode(String(event.error?.client_event_id ?? '').replace(`_${callId}`, ''))}`);
+            return;
+          }
           log(`OpenAI server error: code=${safeCode(event.error?.code)} type=${safeCode(event.error?.type)} param=${safeCode(event.error?.param)} clientEvent=${safeCode(event.error?.client_event_id)} message=${safeDiagnostic(event.error?.message)}`);
           if (!closing && event.error?.client_event_id === toolsUpdateId) {
             setupFailed = true;
