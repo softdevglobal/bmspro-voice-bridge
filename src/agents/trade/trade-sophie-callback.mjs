@@ -99,7 +99,7 @@ export function originate(
  *   handle(req, res, purpose)  the HTTP endpoint. Validates input, dedupes by request id (result kept for an
  *                              hour), allows one dial at a time and at most 100 tracked attempts (else 429).
  */
-export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapacity}) {
+export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapacity, dial = originate}) {
   const did = env.BMSPRO_CALLBACK_PILOT_DID?.trim();
   const mobile = env.BMSPRO_CALLBACK_PILOT_MOBILE?.trim();
   const username = env.BMSPRO_CALLBACK_AMI_USER?.trim();
@@ -140,7 +140,7 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
         let body = '';
         for await (const chunk of request.iterator({destroyOnReturn: false})) {
           body += chunk.toString();
-          if (body.length > 2048) return send(413, {});
+          if (Buffer.byteLength(body) > 8192) return send(413, {});
         }
         input = JSON.parse(body);
       } catch {
@@ -158,12 +158,13 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
       )
         return send(400, {});
       if (
-        purpose === 'overdue_invoice' &&
+        (purpose === 'overdue_invoice' || purpose === 'owner_requested') &&
         (typeof input.customerName !== 'string' ||
           !input.customerName.trim() ||
           input.customerName.length > 120)
       )
         return send(400, {});
+      if(purpose==='owner_requested'&&(!['service','complaint','quotation','invoice','other'].includes(input.ownerRequest?.category)||typeof input.ownerRequest?.instructions!=='string'||input.ownerRequest.instructions.trim().length<10||input.ownerRequest.instructions.length>1000))return send(400,{});
       const existing = attempts.get(input.id);
       if (existing) return send(200, await existing);
       if (dialing || !hasCapacity() || attempts.size >= 100) return send(429, {});
@@ -196,10 +197,11 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
           attemptId: input.id,
           purpose,
           customerName: input.customerName,
+          ...(purpose==='owner_requested'?{ownerRequest:{category:input.ownerRequest.category,instructions:input.ownerRequest.instructions}}:{}),
         });
         setTimeout(() => media.delete(token), 45_000).unref();
         let diagnostic;
-        const status = await originate({
+        const status = await dial({
           username,
           secret,
           number: input.number,

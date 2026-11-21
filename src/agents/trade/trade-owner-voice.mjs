@@ -3,18 +3,23 @@
  *
  * This is not a phone call. The owner's browser creates a WebRTC offer (sdp) and sends it here. The
  * bridge checks it, then forwards it to OpenAI's Realtime API using the bridge's own API key, and sends
- * the answer back. The bridge only validates the request and the tool names (mostly read-only owner
- * reports, plus owner-confirmed knowledge drafts and services; see toolNames below). The tool calls
- * themselves are not made here.
+ * the answer back. The bridge validates the request and known tool names. Tool calls,
+ * owner authorization and write confirmations run on Trade, not here.
  *
  * Flow: Trade dashboard -> POST here (Bearer secret) -> validate -> OpenAI /v1/realtime/calls -> SDP answer.
  */
 import {timingSafeEqual} from 'node:crypto';
 
-// Owner tools the Trade server may offer. The Trade server can send
+// Owner reports and confirmed visit actions the Trade server may offer. Trade can send
 // any of them (so the bridge and Trade can be deployed in either order), but
 // never an unknown or repeated tool.
 const toolNames = new Set([
+  'find_call_customers','prepare_customer_scheduled_call',
+  'prepare_job_create', 'prepare_inspection_create', 'get_services', 'get_staff',
+  'get_work_visits',
+  'prepare_job_schedule', 'prepare_job_assignment', 'prepare_job_cancel',
+  'prepare_inspection_schedule', 'prepare_inspection_assignment', 'prepare_inspection_cancel',
+  'confirm_owner_change', 'cancel_owner_change',
   'get_daily_summary',
   'get_day_activity',
   'get_staff_day_report',
@@ -136,17 +141,18 @@ function authorized(header, secret) {
 /**
  * Build the HTTP handler. Checks, in order: POST, bearer secret, JSON content type, body under 96 KB
  * (read within 10 s), a valid SDP offer, a 64-hex safetyIdentifier, instructions under 4000 chars and an
- * allowed tool list. Any failure returns a bare status code with no body. `fetcher` is replaceable in tests.
+ * allowed tool list. Failures return a status and a fixed diagnostic code, never credentials or payloads.
+ * `fetcher` is replaceable in tests.
  */
 export function createOwnerVoiceHandler({secret, apiKey, model = 'gpt-realtime-2.1', fetcher = fetch}) {
   return async (request, response) => {
-    const fail = status => {
+    const fail = (status, code) => {
       if (response.destroyed) return;
-      response.writeHead(status, {'Cache-Control': 'no-store', Connection: 'close'});
+      response.writeHead(status, {'Cache-Control': 'no-store', Connection: 'close', ...(code ? {'X-BMS-Voice-Error': code} : {})});
       response.end();
     };
     if (request.method !== 'POST') return fail(405);
-    if (!authorized(request.headers.authorization, secret)) return fail(401);
+    if (!authorized(request.headers.authorization, secret)) return fail(401, 'bridge_authorization');
     if (request.headers['content-type'] !== 'application/json') return fail(415);
 
     const controller = new AbortController();
@@ -175,12 +181,12 @@ export function createOwnerVoiceHandler({secret, apiKey, model = 'gpt-realtime-2
         Buffer.byteLength(sdp) > 64 * 1024 ||
         typeof safetyIdentifier !== 'string' ||
         !/^[a-f0-9]{64}$/.test(safetyIdentifier) ||
-        typeof session?.instructions !== 'string' ||
-        session.instructions.length > 4000 ||
-        !validTools(session.tools)
+        typeof session?.instructions !== 'string'
       ) {
         return fail(400);
       }
+      if (session.instructions.length > 4000) return fail(400, 'instructions_limit');
+      if (!validTools(session.tools)) return fail(400, 'tool_whitelist');
 
       const form = new FormData();
       form.set('sdp', sdp);
@@ -203,7 +209,7 @@ export function createOwnerVoiceHandler({secret, apiKey, model = 'gpt-realtime-2
       });
       if (!upstream.ok) {
         console.error('[owner-voice] Realtime connection rejected', {status: upstream.status});
-        return fail(502);
+        return fail(502, 'realtime_rejected');
       }
       const answer = await upstream.text();
       if (response.destroyed) return;
