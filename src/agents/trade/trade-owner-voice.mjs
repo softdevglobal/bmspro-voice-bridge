@@ -117,6 +117,9 @@ const toolNames = new Set([
   'prepare_item_create',
   'prepare_item_update',
   'prepare_item_delete',
+  // Browser-only page control (Trade browser mode): open a page by name, scroll it, press its Refresh
+  // button. Read only: it changes no records.
+  'control_page',
 ]);
 
 /** The tool list is valid only if every tool is a known function, with no repeats and none unknown. */
