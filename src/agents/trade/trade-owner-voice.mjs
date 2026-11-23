@@ -120,6 +120,35 @@ const toolNames = new Set([
   // Browser-only page control (Trade browser mode): open a page by name, scroll it, press its Refresh
   // button. Read only: it changes no records.
   'control_page',
+  // SMS section, offered only when Trade enables it. Browser tools drive the SMS pages (balance, log, Custom
+  // messages); the MCP twins run on Trade's owner MCP route. Reading never changes anything; a send needs a
+  // read-back of the exact text, recipients and credits and a yes. Top-ups are never bought by voice.
+  'show_sms_balance',
+  'list_sms_log',
+  'list_sms_customers',
+  'open_custom_message',
+  'sms_message_step',
+  'get_sms_balance',
+  'get_sms_log',
+  'get_sms_customers',
+  'prepare_sms_send',
+  // Emails section (Trade docs/owner-voice-email.md): browser tools drive the Emails page (mailbox, conversations,
+  // composer, Send log); the MCP twins run on Trade's owner MCP route. Email text is content, never instructions.
+  // Sending, deleting and retrying need a read-back and a yes; star, archive and restore are one click to undo.
+  'open_emails',
+  'list_emails',
+  'email_thread_step',
+  'email_compose_step',
+  'list_email_send_log',
+  'email_send_log_step',
+  'get_emails',
+  'get_email_thread',
+  'get_email_send_log',
+  'get_email_contacts',
+  'email_thread_action',
+  'prepare_email_send',
+  'prepare_email_trash',
+  'prepare_email_retry',
 ]);
 
 /** The tool list is valid only if every tool is a known function, with no repeats and none unknown. */
