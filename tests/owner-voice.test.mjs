@@ -84,3 +84,38 @@ test('owner voice accepts any known read-only tools, but not unknown or repeated
   assert.equal((await start([])).status, 400, 'no tools');
   assert.equal(upstream.mock.callCount(), 6);
 });
+
+// The server owns authorization, pending changes and confirmation; the bridge only allows known names.
+test('owner visit preparation and confirmation tools pass the bridge whitelist', async (t) => {
+ const secret = 'trade-bridge-test-secret-0000000000000000';
+ const upstream = t.mock.fn(async () => new Response('v=0\r\no=answer'));
+ const server = createServer(createOwnerVoiceHandler({secret, apiKey:'fixture-key', fetcher:upstream}));
+ await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
+ t.after(() => new Promise(resolve => server.close(resolve)));
+ const response = await fetch(`http://127.0.0.1:${server.address().port}/owner-voice/session`,{
+  method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${secret}`},
+  body:JSON.stringify({sdp:'v=0\r\no=fixture',safetyIdentifier:'c'.repeat(64),session:{instructions:'Owner visit management.',tools:[
+   'find_call_customers','prepare_customer_scheduled_call','get_work_visits','prepare_job_create','prepare_inspection_create','get_services','get_staff','prepare_job_schedule','prepare_job_assignment','prepare_job_cancel',
+   'prepare_inspection_schedule','prepare_inspection_assignment','prepare_inspection_cancel','confirm_owner_change','cancel_owner_change',
+  ].map(name=>({type:'function',name}))}}),
+ });
+ assert.equal(response.status,200);assert.equal(upstream.mock.callCount(),1);
+});
+
+test('bridge exposes fixed validation codes and rejects invalid setup before contacting OpenAI',async(t)=>{
+ const secret='trade-bridge-test-secret-0000000000000000';
+ const upstream=t.mock.fn(async()=>new Response(null,{status:403}));
+ const server=createServer(createOwnerVoiceHandler({secret,apiKey:'fixture-key',fetcher:upstream}));
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ t.after(()=>new Promise(resolve=>server.close(resolve)));
+ const start=(instructions,names,token=secret)=>fetch(`http://127.0.0.1:${server.address().port}/owner-voice/session`,{
+  method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${token}`},
+  body:JSON.stringify({sdp:'v=0\r\no=fixture',safetyIdentifier:'d'.repeat(64),session:{instructions,tools:names.map(name=>({type:'function',name}))}}),
+ });
+ let response=await start('Fixture.',['unknown_tool']);assert.equal(response.status,400);assert.equal(response.headers.get('x-bms-voice-error'),'tool_whitelist');
+ response=await start('x'.repeat(4001),['get_daily_summary']);assert.equal(response.status,400);assert.equal(response.headers.get('x-bms-voice-error'),'instructions_limit');
+ response=await start('Fixture.',['get_daily_summary'],'wrong');assert.equal(response.status,401);assert.equal(response.headers.get('x-bms-voice-error'),'bridge_authorization');
+ assert.equal(upstream.mock.callCount(),0);
+ t.mock.method(console,'error',()=>undefined);
+ response=await start('Fixture.',['get_daily_summary']);assert.equal(response.status,502);assert.equal(response.headers.get('x-bms-voice-error'),'realtime_rejected');assert.equal(upstream.mock.callCount(),1);
+});

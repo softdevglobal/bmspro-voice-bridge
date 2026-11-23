@@ -11,6 +11,14 @@ permit = 127.0.0.1/255.255.255.255
 read = none
 write = call
 
+; Optional: owner joins on an exact existing Trade call. Keep separate from handoff.
+[bms-live-join]
+secret = REPLACE_WITH_A_SEPARATE_STRONG_RANDOM_SECRET
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
+read = none
+write = originate
+
 ; Separate account for the opt-in callback pilot.
 [bms-sophie-callback]
 secret = REPLACE_WITH_A_SEPARATE_STRONG_RANDOM_SECRET

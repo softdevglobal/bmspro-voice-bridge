@@ -16,8 +16,11 @@ import {createCallTranscript} from '../observability/call-transcript.mjs'; // pe
 import {createCallRecord, sendTradeCallRecord} from '../observability/call-record.mjs'; // call log saved to Trade (Firebase) after hang-up
 import {createOwnerVoiceHandler} from '../agents/trade/trade-owner-voice.mjs';
 import {createLiveListen} from '../agents/trade/trade-live-listen.mjs';
+import {loadLiveJoin} from '../agents/trade/trade-live-join.mjs';
 import {loadOwnerHandoff, ownerHandoffReadiness, redirectToOwner} from '../agents/trade/trade-owner-handoff.mjs';
 import {createSophieCallback} from '../agents/trade/trade-sophie-callback.mjs';
+import {sendLiveContext} from '../agents/live-context.mjs';
+import {ownerRequestedCallInstructions} from '../agents/trade/trade-owner-requested-call.mjs';
 import {clearVoiceGuide} from '../agents/trade/trade-tools.mjs'; // clear, steady phone delivery for the greeting-first start
 
 const SCHEDULE_CUSTOMER_CALLBACK_TOOL = {
@@ -143,7 +146,9 @@ const ownerVoice = process.env.BMSPRO_OWNER_VOICE_ENABLED === 'true' && tenantRo
   : null;
 // ---- HTTP server for health checks and authenticated owner voice setup ----
 const liveListen = process.env.BMSPRO_LIVE_LISTEN_ENABLED === 'true' && tenantRoutes.directTrade
-  ? createLiveListen(tenantRoutes.directTrade.token) : null;
+  ? createLiveListen(tenantRoutes.directTrade.token, {
+      joinConfig: loadLiveJoin(), resolveRoute: did => resolveConfigForDid(did, tenantRoutes),
+    }) : null;
 const server = http.createServer((req, res) => {
   if (req.url === '/sophie-callback' && sophieCallback && !shuttingDown) {
     void sophieCallback.handle(req, res);
@@ -153,8 +158,9 @@ const server = http.createServer((req, res) => {
     void sophieCallback.handle(req, res, 'overdue_invoice');
     return;
   }
-  if (liveListen && !shuttingDown && /^\/live-listen\/(calls$|audio\?)/.test(req.url ?? '')) {
-    liveListen.handle(req, res);
+  if(req.url==='/sophie-owner-call'&&sophieCallback&&!shuttingDown){void sophieCallback.handle(req,res,'owner_requested');return;}
+  if (liveListen && !shuttingDown && /^\/live-listen\/(calls$|audio\?|join\?)/.test(req.url ?? '')) {
+    void liveListen.handle(req, res);
     return;
   }
   if (req.url === '/owner-voice/session' && ownerVoice && !shuttingDown) {
@@ -592,7 +598,9 @@ wss.on('connection', media => {
       const callbackToken = variables?.BMS_CALLBACK_TOKEN ?? variables?._BMS_CALLBACK_TOKEN ?? variables?.__BMS_CALLBACK_TOKEN;
       outbound = callbackToken ? sophieCallback?.take(callbackToken) : undefined;
       const invoiceCall = outbound?.purpose === 'overdue_invoice';
-      if (outbound) callRecord.callback(outbound.attemptId);
+      const ownerCall=outbound?.purpose==='owner_requested';
+      const focusedOutbound=invoiceCall||ownerCall;
+      if (outbound) callRecord.callback(outbound.attemptId,ownerCall);
       if (callbackToken && !outbound) return finish('invalid callback media token');
       try { businessConfig = outbound?.route ?? await resolveMediaStartRoute(event, tenantRoutes); }
       catch (error) {
@@ -636,8 +644,9 @@ wss.on('connection', media => {
         'After they confirm they are the intended contact and can speak, say you are calling about an overdue invoice. Ask if they have received it and whether they expect to pay or need someone from the business to help.',
         'If the intended contact is busy, follow the callback request instructions. If they say it was paid or dispute it, thank them and say you will pass that on. Do not request payment credentials, share bank details or amounts, take payment, or agree to a payment plan. Then say goodbye.',
       ].join(' ') : '';
+      const focusedInstructions=ownerCall?ownerRequestedCallInstructions(outbound,discoveredProfile?.businessName):invoiceInstructions;
       let greetFirst = false;
-      if (!invoiceCall && businessConfig.mode === 'trade' && typeof discoveredProfile?.businessName === 'string' &&
+      if (!focusedOutbound && businessConfig.mode === 'trade' && typeof discoveredProfile?.businessName === 'string' &&
           discoveredProfile.businessName.trim() && typeof discoveredProfile.timezone === 'string') {
         try {
           new Intl.DateTimeFormat('en-AU', {timeZone: discoveredProfile.timezone});
@@ -651,12 +660,12 @@ wss.on('connection', media => {
         outbound ? CALLBACK_REQUEST_RULE : '',
         businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : '',
       ].join(' ');
-      const steerVoice = (suffix, content) => live.send({
+      const steerVoice = (suffix, content) => sendLiveContext(live, {
         type: 'session.instructions.append', event_id: `${suffix}_${callId}`, delegation_id: null, content,
       });
       const resumeCaller = (suffix, content) => {
         steerVoice(suffix, content);
-        if (callerSpokeBeforeTools) live.send({
+        if (callerSpokeBeforeTools) sendLiveContext(live, {
           type: 'session.commentary.append', event_id: `${suffix}_resume_${callId}`, delegation_id: null, content,
         });
       };
@@ -719,10 +728,10 @@ wss.on('connection', media => {
         }
         enableTradeTools();
       };
-      if (invoiceCall) {
+      if (focusedOutbound) {
         backendReadyAt = performance.now();
         businessSession = {tools: [], close: async () => {}, profile: {businessId: businessConfig.businessId},
-          voiceInstructions: invoiceInstructions, backendInstructions: invoiceInstructions};
+          voiceInstructions: focusedInstructions, backendInstructions: focusedInstructions};
       } else if (greetFirst) {
         void prepareBusiness().catch(() => {
           setupFailed = true;
@@ -735,7 +744,7 @@ wss.on('connection', media => {
       }
 
          // ---- Step 3: pick the fixed Sophie greeting for this mode ---- 
-      const greeting = invoiceCall
+      const greeting = focusedOutbound
         ? 'Introduce yourself and ask to speak with the intended contact. Keep the reason for the call private until they confirm.'
         : outbound
         ? `Say you are Sophie, the AI assistant from ${JSON.stringify(discoveredProfile?.businessName ?? businessConfig.businessName ?? 'the business they called')}. Say you are returning a missed call and ask if now is a good time. Listen for a callback request if they are busy. Do not leave private information on voicemail.`
@@ -861,7 +870,7 @@ wss.on('connection', media => {
           inputAudio.start();
           // Request once after readiness as well as seeding session.input. Keep
           // the media clock running; do not wait for caller speech to trigger it.
-          live.send({type: 'session.commentary.append', event_id: `greeting_${callId}`, delegation_id: null, content: greeting});
+          sendLiveContext(live, {type: 'session.commentary.append', event_id: `greeting_${callId}`, delegation_id: null, content: greeting});
           log('Greeting v3: requested Sophie introduction; playback guard=400ms.');
           log(`OpenAI ready; generating opening greeting before answer. voiceReadyMs=${Math.round(liveReadyAt - (greetFirst ? setupStartedAt : backendReadyAt))} totalSetupMs=${Math.round(liveReadyAt - setupStartedAt)}`);
           enableTradeTools();
@@ -878,7 +887,7 @@ wss.on('connection', media => {
             // until actual greeting audio is available, not just session.started.
             command('ANSWER');
             answeredAt = performance.now();
-            listenerFeed = liveListen?.start(callId, businessConfig);
+            listenerFeed = liveListen?.start(callId, businessConfig, {variables: outbound ? null : variables});
             clearTimeout(setupTimer);
             reportActivity('call_answered', {status: 'answered'});
             callRecord.answered();
