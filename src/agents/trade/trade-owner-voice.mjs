@@ -142,6 +142,9 @@ const toolNames = new Set([
   'list_email_send_log',
   'email_send_log_step',
   'get_emails',
+  // Read-only counts (all, unread, and for one day) from Trade's stored copy of the mailbox. Offered in both
+  // Trade tool modes; runs on Trade's owner MCP route and opens no page or email.
+  'get_email_counts',
   'get_email_thread',
   'get_email_send_log',
   'get_email_contacts',
