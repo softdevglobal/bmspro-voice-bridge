@@ -23,7 +23,6 @@ One bridge process serves many businesses; tools and identity are isolated per c
 | **13001** | AI call center server, `127.0.0.1` only | Server end of the SSH reverse tunnel. Anything sent here goes to port 3001 on the Windows PC. | `BMSPRO_TRADE_MCP_URL=http://127.0.0.1:13001/api/ai/mcp` in `.env.trade-direct-pilot` |
 | **3001** | Windows PC | Trade admin panel (Next.js): `/api/ai/mcp` (Trade MCP tools) and `/api/ai/voice` (DID discovery) | Start with `npx next dev --port 3001` |
 | **22** (SSH) | AI call center server, reached over Tailscale at `100.88.220.83` | SSH login and the reverse tunnel | — |
-| **3900** | AI call center server (optional) | VoiceStudio shadow speech-to-text, only when enabled | `BMSPRO_VOICESTUDIO_SHADOW_URL` |
 | Extension **2000** | Asterisk (not a network port) | Dialplan entry that sends calls to the bridge | `deploy/asterisk/extensions.conf.example` |
 
 > **Port check:** Trade's `npm run dev` starts on port **3002**, but the tunnel forwards to **3001**. Start Trade with `npx next dev --port 3001`, or change the tunnel to `...:127.0.0.1:3002`.
@@ -89,7 +88,6 @@ Expected startup log:
 Backend DID routing configured. Black, Pink, Trade and onboarding numbers use separate tools.
 Dialog manager: on.
 Audio pacing follows elapsed time; bounded catch-up enabled.
-VoiceStudio shadow ASR disabled; OpenAI remains the live call path.
 BMSPro voice pilot listening at ws://127.0.0.1:8787/media
 ```
 
@@ -285,7 +283,6 @@ bmspro-voice-bridge/
 │  │  ├─ input-audio.mjs              20 ms paced audio timers
 │  │  └─ draft-typing.mjs             Typing sound + speech detection (PCMU)
 │  ├─ asr/
-│  │  └─ voice-studio-shadow.mjs      Optional comparison speech-to-text
 │  └─ observability/
 │     └─ call-transcript.mjs          Per-call transcript .txt files
 │
@@ -336,7 +333,6 @@ graph TD
     tenant --> black
     bridge --> audio["audio/input-audio.mjs"]
     bridge --> typing["audio/draft-typing.mjs"]
-    bridge --> shadow["asr/voice-studio-shadow.mjs"]
     bridge --> tx["observability/call-transcript.mjs"]
 
     bridge -. external .-> openai[("OpenAI Live")]
@@ -346,7 +342,6 @@ graph TD
     trade -. MCP .-> tr[("BMS Trade<br/>(or Command Center fallback)")]
     tenant -. HTTP .-> cc
     tenant -. HTTP .-> tr
-    shadow -. WebSocket .-> vs[("VoiceStudio")]
     tx -. writes .-> disk[("./transcripts/*.txt")]
 ```
 
@@ -367,7 +362,6 @@ flowchart TD
     C2 -- no --> X2[log error, exit 1]
     C2 -- yes --> D[Create shared OpenAI client]
     D --> D1["dialog: dialogModeFromEnv()<br/>on / observe / off"]
-    D1 --> E[Read VoiceStudio shadow settings]
     E --> F[Check port, max calls, bind host]
     F --> G["Start HTTP server - /health"]
     G --> H["Accept WebSocket /media<br/>(subprotocol 'media')"]
@@ -561,8 +555,6 @@ flowchart LR
         A1["Asterisk<br/>8 kHz PCMU frames"] --> A2["server/bridge.mjs<br/>media.on('message')"]
         A2 --> A3["audio/input-audio.mjs<br/>createInputAudioClock()"]
         A3 --> A4["OpenAI<br/>session.input_audio.append"]
-        A2 --> A5["asr/voice-studio-shadow.mjs<br/>ulaw8kToPcm16k()"]
-        A5 --> A6["VoiceStudio<br/>comparison only"]
     end
 
     subgraph OUT["AI → Caller"]
@@ -627,7 +619,6 @@ The main server: startup, HTTP and WebSocket servers, and everything that happen
 | Startup checks | Stops if `OPENAI_API_KEY` is missing. Calls `loadTenantRoutes()`, exits if routing config is invalid. |
 | `client` | One OpenAI client shared by all calls. |
 | `dialogMode` | Reads `BMSPRO_DIALOG_MANAGER` (`on` / `observe` / `off`) and logs it. |
-| `voiceStudioShadowEnabled` / `voiceStudioShadowDids` | Turns comparison speech-to-text on for numbers in `BMSPRO_VOICESTUDIO_SHADOW_DIDS_JSON`. |
 | `maxCalls`, `port` | Max concurrent calls (`BMSPRO_MAX_CONCURRENT_CALLS`, 1–32, default 4) and port (`BMSPRO_PORT`, default 8787). |
 | `bindHost`, `bindOctets`, `bindIsLoopback`, `bindIsTailscale` | Listening address (`BMSPRO_BIND_HOST`, default 127.0.0.1). Must be loopback or a Tailscale IPv4 (100.64.0.0–100.127.255.255), otherwise startup stops. |
 | `activeCalls`, `stopCalls`, `shuttingDown` | Open calls, a stop function per call, and whether shutdown has started. |
@@ -827,21 +818,6 @@ The gates repeat rules the sessions and backend already enforce, so they never a
 | `pcmuHasSpeech(frame)` | Uses loudness to tell speech from silence. |
 | `sound`, `taps` *(top-level code)* | Generates a 1.6 s keyboard-and-mouse sound (`sound`, 12,800 bytes) once at startup; `taps` are the keystroke positions. |
 | `createDraftTypingCue()` | Returns `start()`, `stop()`, `frame(canPlay)`. Waits 150 ms before playing and stops after 45 s. |
-
----
-
-### [src/asr/voice-studio-shadow.mjs](../src/asr/voice-studio-shadow.mjs)
-
-Optional comparison speech-to-text. Never affects the live call.
-
-| Function | What it does |
-|---|---|
-| `MAX_PENDING_ULAW_BYTES`, `MAX_WS_BUFFERED_BYTES` | Limits: hold at most 1 s of audio while connecting; drop audio if VoiceStudio's send buffer is over 256 KB. |
-| `ulawSampleToPcm16(byte)` | Decodes one μ-law byte. |
-| `ulaw8kToPcm16k(input)` | 8 kHz μ-law to 16 kHz 16-bit PCM. |
-| `safeCode(value)` | Safe characters for logs. |
-| `createVoiceStudioShadow({...})` | Connects to VoiceStudio (secure `wss:` or local `ws:` only). Holds 1 s of audio while connecting. Logs final transcripts (character count only unless `logTranscripts` is on). Returns `append()`, `end()`. |
-| ↳ `report`, `cleanup`, `fail`, `sendAudio` | Logging, clearing timers, error handling, sending audio. |
 
 ---
 

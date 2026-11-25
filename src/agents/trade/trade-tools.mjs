@@ -1,6 +1,7 @@
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {createTradeActionPolicy, writeTools} from './trade-action-policy.mjs';
+import {phoneAccessInstructions} from './trade-caller-access.mjs';
 
 export const TRADE_READ_TOOLS = Object.freeze(['get_business_profile', 'list_services']);
 export function tradeOpeningQuestion({canBookJobs, canRequestInspection}) {
@@ -136,6 +137,8 @@ export async function openTradeSession(config, {onTiming} = {}) {
     fetch: (url, init) => {
       const headers = new Headers(init?.headers);
       if (pinnedBusinessId) headers.set('X-BMSPro-Trade-Business', pinnedBusinessId);
+      if (typeof config.callerNumber === 'string' && /^\+?[\d ()-]{6,40}$/.test(config.callerNumber))
+        headers.set('X-BMSPro-Caller-Number', config.callerNumber);
       return fetch(url, {
         ...init,
         headers,
@@ -231,7 +234,13 @@ export async function openTradeSession(config, {onTiming} = {}) {
       .map(service => ({id: service.id, name: String(service.name).replace(/\s+/g, ' ').trim().slice(0, 80)}))
       .filter(service => service.name)
       .slice(0, 40);
-    const context = `You serve only the Trade business ${JSON.stringify(profile.businessName)}, timezone ${JSON.stringify(profile.timezone)}.`;
+    let callerAccess = config.phoneCallerAccess;
+    if (!callerAccess && inventory.has('get_phone_caller_access')) {
+      try {
+        callerAccess = decode(await client.callTool({name: 'get_phone_caller_access', arguments: {}}, undefined, {timeout: 5000}));
+      } catch { /* Recognition failure leaves customer permissions in force. */ }
+    }
+    const context = `You serve only the Trade business ${JSON.stringify(profile.businessName)}, timezone ${JSON.stringify(profile.timezone)}. ${phoneAccessInstructions(callerAccess)}`;
     const callConfig = {
       ...config,
       mode: 'trade',
