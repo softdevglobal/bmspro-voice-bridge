@@ -158,13 +158,14 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
       )
         return send(400, {});
       if (
-        (purpose === 'overdue_invoice' || purpose === 'owner_requested') &&
+        (purpose === 'overdue_invoice' || purpose === 'owner_requested' || purpose === 'owner_notification') &&
         (typeof input.customerName !== 'string' ||
           !input.customerName.trim() ||
           input.customerName.length > 120)
       )
         return send(400, {});
       if(purpose==='owner_requested'&&(!['service','complaint','quotation','invoice','other'].includes(input.ownerRequest?.category)||typeof input.ownerRequest?.instructions!=='string'||input.ownerRequest.instructions.trim().length<10||input.ownerRequest.instructions.length>1000))return send(400,{});
+      if(purpose==='owner_notification'&&(!input.ownerNotification||typeof input.ownerNotification.requestCode!=='string'||!/^[-A-Za-z0-9 _]{1,80}$/.test(input.ownerNotification.requestCode)))return send(400,{});
       const existing = attempts.get(input.id);
       if (existing) return send(200, await existing);
       if (dialing || !hasCapacity() || attempts.size >= 100) return send(429, {});
@@ -197,6 +198,7 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
           attemptId: input.id,
           purpose,
           customerName: input.customerName,
+          ...(purpose==='owner_notification'?{ownerNotification:{requestCode:input.ownerNotification.requestCode}}:{}),
           ...(purpose==='owner_requested'?{ownerRequest:{category:input.ownerRequest.category,instructions:input.ownerRequest.instructions}}:{}),
         });
         setTimeout(() => media.delete(token), 45_000).unref();

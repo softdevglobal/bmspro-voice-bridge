@@ -11,7 +11,6 @@ import {createInputAudioClock, createPacedAudioTimer} from '../audio/input-audio
 import {createDraftTypingCue, pcmuHasSpeech} from '../audio/draft-typing.mjs'; // typing sound
 import {createBargeInDetector} from '../audio/barge-in.mjs'; // stop Sophie when the caller starts talking
 import {END_CALL_TOOL, END_CALL_VOICE_RULE, END_CALL_BACKEND_RULE, createHangupController} from '../agents/end-call.mjs'; // Sophie can end the call after a goodbye
-import {createVoiceStudioShadow} from '../asr/voice-studio-shadow.mjs'; // side by side seech to text test
 import {createCallTranscript} from '../observability/call-transcript.mjs'; // per-call transcript file writer
 import {createCallRecord, sendTradeCallRecord} from '../observability/call-record.mjs'; // call log saved to Trade (Firebase) after hang-up
 import {createOwnerVoiceHandler} from '../agents/trade/trade-owner-voice.mjs';
@@ -20,8 +19,17 @@ import {loadLiveJoin} from '../agents/trade/trade-live-join.mjs';
 import {loadOwnerHandoff, ownerHandoffReadiness, redirectToOwner} from '../agents/trade/trade-owner-handoff.mjs';
 import {createSophieCallback} from '../agents/trade/trade-sophie-callback.mjs';
 import {sendLiveContext} from '../agents/live-context.mjs';
+import {ownerInspectionNotificationInstructions,ownerPhoneGreeting} from '../agents/trade/trade-owner-notification.mjs';
+import {ownerInspectionDetailsTool} from '../agents/trade/trade-owner-inspection-details.mjs';
+import {openOwnerPhoneBriefing} from '../agents/trade/trade-owner-phone-briefing.mjs';
+import {CUSTOMER_ACCESS_RULE, OWNER_INBOUND_GREETING, isOwnerCandidate, recognizePhoneCaller, phoneAccessInstructions} from '../agents/trade/trade-caller-access.mjs';
 import {ownerRequestedCallInstructions} from '../agents/trade/trade-owner-requested-call.mjs';
 import {clearVoiceGuide} from '../agents/trade/trade-tools.mjs'; // clear, steady phone delivery for the greeting-first start
+import {createOwnerDeepgram} from '../agents/trade/trade-owner-deepgram.mjs';
+import {DeepgramVoice} from '../audio/providers/deepgram.mjs';
+import {loadAudioProviderConfig, useDeepgram} from '../audio/providers/config.mjs';
+
+const audioProviderConfig = await loadAudioProviderConfig();
 
 const SCHEDULE_CUSTOMER_CALLBACK_TOOL = {
   type: 'function', name: 'schedule_customer_callback', strict: false,
@@ -65,25 +73,6 @@ const ownerHandoff = loadOwnerHandoff();
 const dialogMode = dialogModeFromEnv(); // BMSPRO_DIALOG_MANAGER: on (default), observe or off
 console.log(`Dialog manager: ${dialogMode}.`);
 console.log('Audio pacing follows elapsed time; bounded catch-up enabled.');
-
-// ---- Optional "shadow" speech-to-text (VoiceStudio), for comparison only ----
-const voiceStudioShadowEnabled = process.env.BMSPRO_VOICESTUDIO_SHADOW_ENABLED === 'true';
-const voiceStudioShadowDids = (() => {
-  try {
-    // Allowlist of phone numbers (DIDs) that get shadow ASR, as a JSON array of strings.
-    const value = JSON.parse(process.env.BMSPRO_VOICESTUDIO_SHADOW_DIDS_JSON || '[]');
-    if (!Array.isArray(value) || value.some(did => typeof did !== 'string')) throw new Error();
-    return new Set(value.map(did => did.replace(/\D/g, '')).filter(Boolean));
-  } catch {
-    console.warn('VoiceStudio shadow ASR disabled: BMSPRO_VOICESTUDIO_SHADOW_DIDS_JSON must be a JSON array of DID strings.');
-    return new Set();
-  }
-})();
-if (voiceStudioShadowEnabled && voiceStudioShadowDids.size) {
-  console.log(`VoiceStudio shadow ASR enabled for ${voiceStudioShadowDids.size} allowlisted DID(s); OpenAI remains the live call path.`);
-} else {
-  console.log('VoiceStudio shadow ASR disabled; OpenAI remains the live call path.');
-}
 
 // ---- Server settings and validation ----
 
@@ -144,6 +133,9 @@ const ownerVoice = process.env.BMSPRO_OWNER_VOICE_ENABLED === 'true' && tenantRo
       model: process.env.OPENAI_REALTIME_MODEL?.trim() || undefined,
     })
   : null;
+const ownerDeepgram = process.env.BMSPRO_OWNER_VOICE_ENABLED === 'true' && process.env.BMSPRO_OWNER_DEEPGRAM_ENABLED === 'true' && tenantRoutes.directTrade
+  ? createOwnerDeepgram({secret:tenantRoutes.directTrade.token,key:audioProviderConfig.key,client}) : null;
+if(ownerDeepgram && !audioProviderConfig.key) throw new Error('Owner Deepgram requires the Deepgram audio provider and secret.');
 // ---- HTTP server for health checks and authenticated owner voice setup ----
 const liveListen = process.env.BMSPRO_LIVE_LISTEN_ENABLED === 'true' && tenantRoutes.directTrade
   ? createLiveListen(tenantRoutes.directTrade.token, {
@@ -158,11 +150,13 @@ const server = http.createServer((req, res) => {
     void sophieCallback.handle(req, res, 'overdue_invoice');
     return;
   }
+  if(req.url==='/sophie-owner-notification'&&sophieCallback&&!shuttingDown){void sophieCallback.handle(req,res,'owner_notification');return;}
   if(req.url==='/sophie-owner-call'&&sophieCallback&&!shuttingDown){void sophieCallback.handle(req,res,'owner_requested');return;}
   if (liveListen && !shuttingDown && /^\/live-listen\/(calls$|audio\?|join\?)/.test(req.url ?? '')) {
     void liveListen.handle(req, res);
     return;
   }
+  if(req.url==='/owner-voice/deepgram-session' && ownerDeepgram && !shuttingDown){void ownerDeepgram.handle(req,res);return;}
   if (req.url === '/owner-voice/session' && ownerVoice && !shuttingDown) {
     void ownerVoice(req, res);
     return;
@@ -174,6 +168,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({noServer: true, maxPayload: 65500,
   handleProtocols: protocols => protocols.has('media') ? 'media' : false});
 server.on('upgrade', (req, socket, head) => {
+  if(req.url==='/owner-voice/audio' && ownerDeepgram && !shuttingDown){ownerDeepgram.upgrade(req,socket,head);return;}
   if (req.url !== '/media' || shuttingDown || activeCalls.size >= maxCalls || !req.headers['sec-websocket-protocol']?.split(',').map(x => x.trim()).includes('media')) {
     socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
     return;
@@ -203,13 +198,14 @@ wss.on('connection', media => {
     .replace(/\+?(?:\d[\s().-]*){8,}/g, '[redacted-number]')
     .replace(/\b(?:sk|sess|re)_[A-Za-z0-9_-]{12,}\b/g, '[redacted-token]')
     .replace(/[^\x20-\x7E]/g, '?').slice(0, 240);
-  let live, businessSession, businessConfig, outbound, activeCallerNumber, activeCallerOptOutNumber, voiceStudioShadow, connecting = false, ready = false, closing = false, paused = false, released = false;
+  let live, businessSession, businessConfig, outbound, activeCallerNumber, activeCallerOptOutNumber, connecting = false, ready = false, closing = false, paused = false, released = false;
   let activityConfig, activityStartedAt, ownerDestination, handoffAttempted = false;
   let pendingCallback;
   let dialog = null; // per-call dialog manager, created once the agent session is open
   let toolQueue = Promise.resolve();
   const handledCalls = new Set();
   let queue = Buffer.alloc(0), finalTimer;
+  let synthesisBuffering=false, synthesisComplete=false;
   const draftTyping = createDraftTypingCue({onPlayback: () => log(`Typing audio: playback started (v4); mode=${safeCode(businessConfig?.mode)}.`)});
   let lastSpeechPlaybackAt = -Infinity, leadSent = false;
   const bargeIn = createBargeInDetector();
@@ -306,7 +302,6 @@ wss.on('connection', media => {
     endReason = reason;
     clearTimeout(setupTimer); pump.stop();
     inputAudio.stop();
-    voiceStudioShadow?.end();
     draftTyping.stop();
     // A confirmed write already in flight may complete after hangup. Do not abort
     // it and retry: retain the backend's outcome and close the MCP session after it.
@@ -348,8 +343,19 @@ wss.on('connection', media => {
     }
   };
   const connectVoice = () => {
-    log('Connecting to OpenAI.');
-    live = new LiveWS(client, {reconnect: null, maxQueueSize: 64000});
+    const deepgram = useDeepgram(audioProviderConfig, businessConfig);
+    log(`Connecting speech provider: ${deepgram ? 'deepgram-au' : 'gpt-live'}.`);
+    live = deepgram ? new DeepgramVoice(client, {key: audioProviderConfig.key, acknowledgeLookups:true,
+        greeting: !outbound && isOwnerCandidate(businessConfig.phoneCallerAccess) ? OWNER_INBOUND_GREETING
+          : outbound?.purpose === 'owner_notification'
+          ? ownerPhoneGreeting(outbound.customerName)
+          : outbound?.purpose === 'overdue_invoice' || outbound?.purpose === 'owner_requested'
+          ? `Hello, my name is Sophie, the AI assistant from ${businessConfig.discoveredProfile?.businessName || businessConfig.businessName || 'the business'}. May I speak with ${outbound.customerName || 'the intended contact'}?`
+          : outbound
+          ? `Hello, my name is Sophie, the AI assistant from ${businessConfig.discoveredProfile?.businessName || businessConfig.businessName || 'the business'}. I am returning a missed call. Is now a good time?`
+          : `Hi, thanks for calling ${businessConfig.discoveredProfile?.businessName || businessConfig.businessName || 'the business'}. My name is Sophie, your AI receptionist. How can I help?`,
+      })
+      : new LiveWS(client, {reconnect: null, maxQueueSize: 64000});
     live.on('error', error => {
       // Avoid dumping SDK errors that can include credentials or caller content.
       const detail = error?.error?.error ?? error?.error ?? error;
@@ -395,8 +401,8 @@ wss.on('connection', media => {
       const endCall = item.name === END_CALL_TOOL.name;
       const scheduleCallback = item.name === SCHEDULE_CUSTOMER_CALLBACK_TOOL.name;
       const recordCustomerOptOut = item.name === RECORD_CUSTOMER_OPT_OUT_TOOL.name;
-      const allowed = endCall || (scheduleCallback && !!outbound) ||
-        (recordCustomerOptOut && businessConfig?.mode === 'trade' && !!activeCallerOptOutNumber) ||
+      const allowed = endCall || (scheduleCallback && !!outbound && outbound.purpose !== 'owner_notification') ||
+        (recordCustomerOptOut && outbound?.purpose !== 'owner_notification' && businessConfig?.mode === 'trade' && !!activeCallerOptOutNumber) ||
         (toolsEnabled && businessSession?.tools.some(tool => tool.name === item.name) === true);
       try {
         if (!allowed || typeof item.arguments !== 'string' || item.arguments.length > (businessConfig.mode === 'onboarding' ? 65536 : 8192))
@@ -541,7 +547,10 @@ wss.on('connection', media => {
     if (media.bufferedAmount > 64000) return finish('media socket backpressure');
     // Keep the beginning of the greeting queued while the answered SIP/RTP
     // path settles. Continue sending silence without discarding speech.
-    const playbackReady = answeredAt !== undefined && performance.now() - answeredAt >= 400;
+        // Deepgram may deliver small bursts. Hold 120ms at each utterance start,
+    // but release short replies as soon as synthesis finishes.
+    if (synthesisBuffering && (queue.length >= 960 || synthesisComplete)) synthesisBuffering=false;
+    const playbackReady = answeredAt !== undefined && performance.now() - answeredAt >= 400 && !synthesisBuffering;
     // Once, when playback starts: queue the jitter-buffer lead in Asterisk as
     // silence. From then on one frame per tick keeps that lead constant.
     if (playbackReady && !leadSent) {
@@ -576,7 +585,6 @@ wss.on('connection', media => {
     if (closing) return;
     try {
       if (binary) {
-        voiceStudioShadow?.append(data);
         if (ready && live.socket.readyState === 1) {
           inputAudio.append(data);
         }
@@ -599,8 +607,10 @@ wss.on('connection', media => {
       outbound = callbackToken ? sophieCallback?.take(callbackToken) : undefined;
       const invoiceCall = outbound?.purpose === 'overdue_invoice';
       const ownerCall=outbound?.purpose==='owner_requested';
-      const focusedOutbound=invoiceCall||ownerCall;
-      if (outbound) callRecord.callback(outbound.attemptId,ownerCall);
+      const ownerNotificationCall=outbound?.purpose==='owner_notification';
+      const focusedOutbound=invoiceCall||ownerCall||ownerNotificationCall;
+      const customerOutbound=!!outbound&&!ownerNotificationCall;
+      if (outbound) callRecord.callback(outbound.attemptId,ownerCall||ownerNotificationCall);
       if (callbackToken && !outbound) return finish('invalid callback media token');
       try { businessConfig = outbound?.route ?? await resolveMediaStartRoute(event, tenantRoutes); }
       catch (error) {
@@ -622,17 +632,13 @@ wss.on('connection', media => {
       activityConfig = businessConfig;
       // Optional: the dialplan may pass the caller's number as BMS_CALLER_ID.
       activeCallerNumber = outbound?.number ?? variables?.BMS_CALLER_ID ?? variables?.__BMS_CALLER_ID ?? null;
+      businessConfig = {...businessConfig, callerNumber: activeCallerNumber};
+      if (!outbound && businessConfig.mode === 'trade') {
+        businessConfig.phoneCallerAccess = await recognizePhoneCaller(businessConfig, activeCallerNumber);
+        if (closing) return;
+      }
       activeCallerOptOutNumber = normalizeOptOutNumber(activeCallerNumber);
       callRecord.caller(activeCallerNumber);
-      if (voiceStudioShadowEnabled && voiceStudioShadowDids.has(String(businessConfig.did || '').replace(/\D/g, ''))) {
-        voiceStudioShadow = createVoiceStudioShadow({
-          WebSocket,
-          url: process.env.BMSPRO_VOICESTUDIO_SHADOW_URL || 'ws://127.0.0.1:3900/v1/audio/transcriptions/stream?pcm=1&sr=16000',
-          apiKey: process.env.BMSPRO_VOICESTUDIO_API_KEY,
-          log,
-          logTranscripts: process.env.BMSPRO_VOICESTUDIO_SHADOW_LOG_TRANSCRIPTS === 'true',
-        });
-      }
       activityStartedAt = Date.now();
       reportActivity('call_started', {status: 'routing'});
       setupStartedAt = performance.now();
@@ -644,7 +650,7 @@ wss.on('connection', media => {
         'After they confirm they are the intended contact and can speak, say you are calling about an overdue invoice. Ask if they have received it and whether they expect to pay or need someone from the business to help.',
         'If the intended contact is busy, follow the callback request instructions. If they say it was paid or dispute it, thank them and say you will pass that on. Do not request payment credentials, share bank details or amounts, take payment, or agree to a payment plan. Then say goodbye.',
       ].join(' ') : '';
-      const focusedInstructions=ownerCall?ownerRequestedCallInstructions(outbound,discoveredProfile?.businessName):invoiceInstructions;
+      const focusedInstructions=ownerNotificationCall?ownerInspectionNotificationInstructions(outbound,discoveredProfile?.businessName):ownerCall?ownerRequestedCallInstructions(outbound,discoveredProfile?.businessName):invoiceInstructions;
       let greetFirst = false;
       if (!focusedOutbound && businessConfig.mode === 'trade' && typeof discoveredProfile?.businessName === 'string' &&
           discoveredProfile.businessName.trim() && typeof discoveredProfile.timezone === 'string') {
@@ -656,8 +662,9 @@ wss.on('connection', media => {
       const toolsUpdateId = `trade_tools_${callId}`;
       let toolsUpdateSent = false, setupFailed = false, callerSpokeBeforeTools = false, dateInstructions;
       const backendPrompt = () => [
+        businessConfig.mode === 'trade' && !ownerNotificationCall ? CUSTOMER_ACCESS_RULE : '',
         businessSession.backendInstructions ?? backendInstructions(businessConfig), END_CALL_BACKEND_RULE,
-        outbound ? CALLBACK_REQUEST_RULE : '',
+        customerOutbound ? CALLBACK_REQUEST_RULE : '',
         businessSession.turnInstructions || '', dateInstructions, dialog?.enforce ? DIALOG_INSTRUCTIONS : '',
       ].join(' ');
       const steerVoice = (suffix, content) => sendLiveContext(live, {
@@ -678,8 +685,8 @@ wss.on('connection', media => {
         if (!businessSession) return;
         toolsUpdateSent = true;
         live.send({type: 'session.update', event_id: toolsUpdateId, session: {delegation: {
-          type: 'responses', responses: {tools: [...businessSession.tools, ...(outbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL] : []),
-            ...(businessConfig.mode === 'trade' && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], tool_choice: 'auto', instructions: backendPrompt()},
+          type: 'responses', responses: {tools: [...businessSession.tools, ...(customerOutbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL] : []),
+            ...(businessConfig.mode === 'trade' && !ownerNotificationCall && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], tool_choice: 'auto', instructions: backendPrompt()},
         }}});
         // The voice model started with a short holding prompt; give it the service list and email-spelling rules now.
         // Sent in parts: OpenAI rejects a single instructions append over 500 tokens.
@@ -730,8 +737,14 @@ wss.on('connection', media => {
       };
       if (focusedOutbound) {
         backendReadyAt = performance.now();
-        businessSession = {tools: [], close: async () => {}, profile: {businessId: businessConfig.businessId},
+        const inspectionDetails = ownerNotificationCall ? ownerInspectionDetailsTool(businessConfig,outbound) : undefined;
+        const ownerBriefing = ownerNotificationCall ? await openOwnerPhoneBriefing(businessConfig,outbound) : undefined;
+        if(closing)return;
+        businessSession = {tools: [...(inspectionDetails ? [inspectionDetails.tool] : []),...(ownerBriefing?.tools??[])],
+          call:async(name,args)=>name==='get_notified_inspection'&&inspectionDetails?inspectionDetails.call(name,args):ownerBriefing?.call(name,args),
+          close: async () => {}, profile: {businessId: businessConfig.businessId},
           voiceInstructions: focusedInstructions, backendInstructions: focusedInstructions};
+        toolsEnabled = true;
       } else if (greetFirst) {
         void prepareBusiness().catch(() => {
           setupFailed = true;
@@ -745,7 +758,9 @@ wss.on('connection', media => {
 
          // ---- Step 3: pick the fixed Sophie greeting for this mode ---- 
       const greeting = focusedOutbound
-        ? 'Introduce yourself and ask to speak with the intended contact. Keep the reason for the call private until they confirm.'
+        ? ownerNotificationCall ? `Say exactly: ${ownerPhoneGreeting(outbound.customerName)} Then listen. Keep the reason private until they confirm they can speak.` : 'Introduce yourself and ask to speak with the intended contact. Keep the reason for the call private until they confirm.'
+        : isOwnerCandidate(businessConfig.phoneCallerAccess)
+        ? `Say this greeting exactly, then listen: ${OWNER_INBOUND_GREETING}`
         : outbound
         ? `Say you are Sophie, the AI assistant from ${JSON.stringify(discoveredProfile?.businessName ?? businessConfig.businessName ?? 'the business they called')}. Say you are returning a missed call and ask if now is a good time. Listen for a callback request if they are busy. Do not leave private information on voicemail.`
         : greetFirst
@@ -767,11 +782,13 @@ wss.on('connection', media => {
             greetFirst
               ? `You are the receptionist for ${JSON.stringify(discoveredProfile.businessName)}. Greet and listen while Trade connects. If a caller asks for a booking, business lookup or transfer before the tools are ready, acknowledge their request briefly and retain what they said. Wait for the tool-ready instruction before delegating. Never invent business details or claim an action succeeded without a verified result. ${clearVoiceGuide}`
               : businessSession.voiceInstructions ?? voiceInstructions(businessConfig),
-            'Your name is Sophie. Identify yourself as Sophie, the AI assistant, in the opening greeting. For onboarding, you are Sophie from BMS Pro helping with business setup; do not ask the caller to choose an AI receptionist name.',
+            businessConfig.mode === 'trade' && !ownerNotificationCall ? CUSTOMER_ACCESS_RULE : '',
+            !outbound && isOwnerCandidate(businessConfig.phoneCallerAccess) ? phoneAccessInstructions(businessConfig.phoneCallerAccess) : '',
+            ownerNotificationCall ? 'Your name is Sophie. Use the supplied personal owner greeting. Do not introduce yourself as the AI receptionist or repeat the business name. If asked whether you are AI, answer honestly.' : 'Your name is Sophie. Identify yourself as Sophie, the AI assistant, in the opening greeting. For onboarding, you are Sophie from BMS Pro helping with business setup; do not ask the caller to choose an AI receptionist name.',
             outbound && !invoiceCall ? 'Ask if now is a good time. If they decline without asking for a callback, thank them and end the call. Keep customer information private on voicemail or with the wrong person.' : '',
-            outbound ? CALLBACK_REQUEST_RULE : '',
-            outbound ? 'If the verified customer clearly asks this business to stop calling them, call record_customer_do_not_call once. Do not use it for a request to call later. Confirm their request in a brief reply; if recording fails, say you could not save it and tell them the business will be notified. This records a business-specific opt-out.' : '',
-            businessConfig.mode === 'trade' && activeCallerOptOutNumber ? 'record_customer_do_not_call is available only for this current Trade call and takes no phone number. Use it only after the person has confirmed they are the intended customer and clearly asked not to receive further calls. Do not use it for requests to call later. Only say the block was saved after RECORDED; if it fails, say you could not save it and the business will be notified.' : '',
+            customerOutbound ? CALLBACK_REQUEST_RULE : '',
+            customerOutbound ? 'If the verified customer clearly asks this business to stop calling them, call record_customer_do_not_call once. Do not use it for a request to call later. Confirm their request in a brief reply; if recording fails, say you could not save it and tell them the business will be notified. This records a business-specific opt-out.' : '',
+            businessConfig.mode === 'trade' && !ownerNotificationCall && activeCallerOptOutNumber ? 'record_customer_do_not_call is available only for this current Trade call and takes no phone number. Use it only after the person has confirmed they are the intended customer and clearly asked not to receive further calls. Do not use it for requests to call later. Only say the block was saved after RECORDED; if it fails, say you could not save it and the business will be notified.' : '',
             'Keep routine replies to one or two short sentences and ask one question at a time. If backend work takes time, briefly acknowledge the request while waiting; do not announce an unverified result.',
             'If the caller starts talking while you are speaking, stop at once, listen to them and respond to what they said; do not finish or repeat the sentence you were saying.',
             END_CALL_VOICE_RULE,
@@ -789,15 +806,25 @@ wss.on('connection', media => {
               tool_choice: outbound ? 'auto' : 'none',
               instructions: outbound ? CALLBACK_REQUEST_RULE + ' ' + END_CALL_BACKEND_RULE
                 : 'Trade is connecting. Retain the caller’s request and acknowledge it briefly. Do not claim an action was performed.',
-            } : {tools: [...businessSession.tools, ...(outbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL] : []),
-              ...(businessConfig.mode === 'trade' && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], instructions: backendPrompt()}),
+            } : {tools: [...businessSession.tools, ...(customerOutbound ? [SCHEDULE_CUSTOMER_CALLBACK_TOOL] : []),
+              ...(businessConfig.mode === 'trade' && !ownerNotificationCall && activeCallerOptOutNumber ? [RECORD_CUSTOMER_OPT_OUT_TOOL] : []), END_CALL_TOOL], instructions: backendPrompt()}),
           }}
         }});
       };
     // ---- Events coming from OpenAI Live ----
       live.on('event', event => {
+        if(event.type==='session.latency')log('Audio timing: stage='+event.stage+' durationMs='+event.durationMs);
         transcript?.event(event);
         callRecord.event(event);
+                if (event.type === 'session.synthesis.started') { synthesisBuffering=true; synthesisComplete=false; }
+        if (event.type === 'session.synthesis.done') { synthesisComplete=true; }
+        if (event.type === 'session.caller_speech.started') {
+          synthesisBuffering=false; synthesisComplete=false;
+          queue = Buffer.alloc(0);
+          draftTyping.stop();
+          command('FLUSH_MEDIA'); leadSent = false;
+          hangup.cancel();
+        }
         if (!closing && answeredAt !== undefined && bargeIn.isNewCallerTurn(event)) {
           interruptPlayback();
           // The caller is still talking after Sophie offered to end the call: stay on the line.
@@ -908,7 +935,7 @@ wss.on('connection', media => {
 server.on('error', error => { console.error(`Listener error: ${error.code}`); process.exitCode = 1; });
 server.listen(port, bindHost, () => console.log(`BMSPro voice pilot listening at ws://${bindHost}:${port}/media`));
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
-  shuttingDown = true;
+  shuttingDown = true; ownerDeepgram?.close();
   for (const stop of stopCalls.values()) stop();
   server.close();
   setTimeout(() => process.exit(0), 16000).unref();

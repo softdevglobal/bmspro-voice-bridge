@@ -155,7 +155,7 @@ const toolNames = new Set([
 ]);
 
 /** The tool list is valid only if every tool is a known function, with no repeats and none unknown. */
-function validTools(tools) {
+export function validTools(tools) {
   return (
     Array.isArray(tools) &&
     tools.length > 0 &&
@@ -166,7 +166,7 @@ function validTools(tools) {
 }
 
 /** Constant-time check of "Authorization: Bearer <secret>"; a secret under 32 chars is never accepted. */
-function authorized(header, secret) {
+export function authorized(header, secret) {
   if (!secret || secret.length < 32) return false;
   const actual = Buffer.from(header ?? '');
   const expected = Buffer.from(`Bearer ${secret}`);
