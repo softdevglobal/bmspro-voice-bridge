@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import test from 'node:test';
 import {createSophieCallback} from '../src/agents/trade/trade-sophie-callback.mjs';
-import {ownerRequestedCallInstructions} from '../src/agents/trade/trade-owner-requested-call.mjs';
+import {ownerRequestedCallInstructions,ownerRequestedCallGreeting} from '../src/agents/trade/trade-owner-requested-call.mjs';
 import {createCallRecord} from '../src/observability/call-record.mjs';
 
 test('owner-requested calls carry the purpose through a one-time media token and dedupe the dial',async(t)=>{
@@ -19,7 +19,16 @@ test('owner-requested calls carry the purpose through a one-time media token and
  const context=service.take(token);assert.equal(context.purpose,'owner_requested');assert.deepEqual(context.ownerRequest,input.ownerRequest);assert.equal(service.take(token),undefined);
  const prompt=ownerRequestedCallInstructions(context,'Fixture Business');
  assert.match(prompt,/Ask whether the repair resolved/);assert.match(prompt,/Before they confirm identity/);assert.match(prompt,/unverified business context/);assert.match(prompt,/not verified payment/);
+ const direct={...input,id:'b'.repeat(64),customerName:'the intended contact',ownerRequest:{...input.ownerRequest,recipientNameKnown:false}};assert.equal((await post(direct)).status,200);assert.equal(service.take(token).ownerRequest.recipientNameKnown,false);
  const record=createCallRecord({callId:'0a41e31d-0620-47d1-9ef9-c9c60cef73a8'});record.callback(input.id,true);
  assert.equal(record.build().ownerScheduledCall,true);assert.equal(record.build().callbackAttemptId,input.id);
  assert.ok(!JSON.stringify(record.build()).includes(input.ownerRequest.instructions));
+});
+
+test('number-only owner call preserves unknown identity and uses a greeting without a forced customer name',()=>{
+ const outbound={customerName:'the intended contact',ownerRequest:{category:'service',instructions:'Ask whether they would like to discuss their enquiry.',recipientNameKnown:false}};
+ const greeting=ownerRequestedCallGreeting(outbound,'Fixture Business');
+ assert.match(greeting,/owner asked me to contact this number/);assert.doesNotMatch(greeting,/May I speak|intended contact/);
+ const instructions=ownerRequestedCallInstructions(outbound,'Fixture Business');
+ assert.match(instructions,/No customer name or identity has been verified/);assert.match(instructions,/Do not demand a customer name/);assert.match(instructions,/withholding private account/);
 });

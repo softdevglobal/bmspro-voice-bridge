@@ -8,6 +8,7 @@ import {openAgentSession, openingGreeting} from '../agents/registry.mjs'; // mod
 import {createDialogManager, dialogModeFromEnv, DIALOG_INSTRUCTIONS} from '../dialog/dialog-manager.mjs'; // per-call conversation steps and write gates
 import {loadTenantRoutes, resolveConfigForDid, resolveMediaStartRoute} from '../routing/tenant-routing.mjs'; // dialled number (DID) business routing
 import {createInputAudioClock, createPacedAudioTimer} from '../audio/input-audio.mjs'; // paced audio send/receive timers
+import {createOutputQueueGuard} from '../audio/output-queue-guard.mjs';
 import {createDraftTypingCue, pcmuHasSpeech} from '../audio/draft-typing.mjs'; // typing sound
 import {createBargeInDetector} from '../audio/barge-in.mjs'; // stop Sophie when the caller starts talking
 import {END_CALL_TOOL, END_CALL_VOICE_RULE, END_CALL_BACKEND_RULE, createHangupController} from '../agents/end-call.mjs'; // Sophie can end the call after a goodbye
@@ -22,8 +23,9 @@ import {sendLiveContext} from '../agents/live-context.mjs';
 import {ownerInspectionNotificationInstructions,ownerPhoneGreeting} from '../agents/trade/trade-owner-notification.mjs';
 import {ownerInspectionDetailsTool} from '../agents/trade/trade-owner-inspection-details.mjs';
 import {openOwnerPhoneBriefing} from '../agents/trade/trade-owner-phone-briefing.mjs';
+import {createQuotationFollowUpSession,quotationFollowUpInstructions} from '../agents/trade/trade-quotation-follow-up.mjs';
 import {CUSTOMER_ACCESS_RULE, OWNER_INBOUND_GREETING, isOwnerCandidate, recognizePhoneCaller, phoneAccessInstructions} from '../agents/trade/trade-caller-access.mjs';
-import {ownerRequestedCallInstructions} from '../agents/trade/trade-owner-requested-call.mjs';
+import {ownerRequestedCallInstructions,ownerRequestedCallGreeting} from '../agents/trade/trade-owner-requested-call.mjs';
 import {clearVoiceGuide} from '../agents/trade/trade-tools.mjs'; // clear, steady phone delivery for the greeting-first start
 import {createOwnerDeepgram} from '../agents/trade/trade-owner-deepgram.mjs';
 import {DeepgramVoice} from '../audio/providers/deepgram.mjs';
@@ -151,6 +153,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if(req.url==='/sophie-owner-notification'&&sophieCallback&&!shuttingDown){void sophieCallback.handle(req,res,'owner_notification');return;}
+  if(req.url==='/sophie-quotation-call'&&sophieCallback&&!shuttingDown){void sophieCallback.handle(req,res,'quotation_followup');return;}
   if(req.url==='/sophie-owner-call'&&sophieCallback&&!shuttingDown){void sophieCallback.handle(req,res,'owner_requested');return;}
   if (liveListen && !shuttingDown && /^\/live-listen\/(calls$|audio\?|join\?)/.test(req.url ?? '')) {
     void liveListen.handle(req, res);
@@ -205,6 +208,7 @@ wss.on('connection', media => {
   let toolQueue = Promise.resolve();
   const handledCalls = new Set();
   let queue = Buffer.alloc(0), finalTimer;
+  let outputQueueGuard=createOutputQueueGuard();
   let synthesisBuffering=false, synthesisComplete=false;
   const draftTyping = createDraftTypingCue({onPlayback: () => log(`Typing audio: playback started (v4); mode=${safeCode(businessConfig?.mode)}.`)});
   let lastSpeechPlaybackAt = -Infinity, leadSent = false;
@@ -218,6 +222,7 @@ wss.on('connection', media => {
     if (!bargeInEnabled || !sophieAudible) return;
     const droppedMs = Math.round(queue.length / 8);
     queue = Buffer.alloc(0);
+    outputQueueGuard.clear();
     draftTyping.stop();
     if (playbackLeadFrames && leadSent) { command('FLUSH_MEDIA'); leadSent = false; }
     log(`Barge-in: caller spoke; stopped Sophie and dropped ${droppedMs}ms of queued audio.`);
@@ -344,12 +349,15 @@ wss.on('connection', media => {
   };
   const connectVoice = () => {
     const deepgram = useDeepgram(audioProviderConfig, businessConfig);
+    outputQueueGuard=createOutputQueueGuard({deepgram});
     log(`Connecting speech provider: ${deepgram ? 'deepgram-au' : 'gpt-live'}.`);
     live = deepgram ? new DeepgramVoice(client, {key: audioProviderConfig.key, acknowledgeLookups:true,
         greeting: !outbound && isOwnerCandidate(businessConfig.phoneCallerAccess) ? OWNER_INBOUND_GREETING
           : outbound?.purpose === 'owner_notification'
           ? ownerPhoneGreeting(outbound.customerName)
-          : outbound?.purpose === 'overdue_invoice' || outbound?.purpose === 'owner_requested'
+          : outbound?.purpose === 'owner_requested'
+          ? ownerRequestedCallGreeting(outbound,businessConfig.discoveredProfile?.businessName || businessConfig.businessName)
+          : outbound?.purpose === 'overdue_invoice' || outbound?.purpose === 'owner_requested' || outbound?.purpose === 'quotation_followup'
           ? `Hello, my name is Sophie, the AI assistant from ${businessConfig.discoveredProfile?.businessName || businessConfig.businessName || 'the business'}. May I speak with ${outbound.customerName || 'the intended contact'}?`
           : outbound
           ? `Hello, my name is Sophie, the AI assistant from ${businessConfig.discoveredProfile?.businessName || businessConfig.businessName || 'the business'}. I am returning a missed call. Is now a good time?`
@@ -401,7 +409,7 @@ wss.on('connection', media => {
       const endCall = item.name === END_CALL_TOOL.name;
       const scheduleCallback = item.name === SCHEDULE_CUSTOMER_CALLBACK_TOOL.name;
       const recordCustomerOptOut = item.name === RECORD_CUSTOMER_OPT_OUT_TOOL.name;
-      const allowed = endCall || (scheduleCallback && !!outbound && outbound.purpose !== 'owner_notification') ||
+      const allowed = endCall || (scheduleCallback && !!outbound && !['owner_notification','quotation_followup'].includes(outbound.purpose)) ||
         (recordCustomerOptOut && outbound?.purpose !== 'owner_notification' && businessConfig?.mode === 'trade' && !!activeCallerOptOutNumber) ||
         (toolsEnabled && businessSession?.tools.some(tool => tool.name === item.name) === true);
       try {
@@ -543,6 +551,8 @@ wss.on('connection', media => {
   // return media path; RTP comfort-noise alone did not establish it in this setup.
   // Continue silent frames between utterances, keeping the playback queue short.
   const pump = createPacedAudioTimer({tick: () => {
+    const outputFailure=outputQueueGuard.check(queue.length);
+    if(!closing&&outputFailure)return finish(outputFailure);
     if (!connecting || closing || paused || media.readyState !== 1) return;
     if (media.bufferedAmount > 64000) return finish('media socket backpressure');
     // Keep the beginning of the greeting queued while the answered SIP/RTP
@@ -561,6 +571,7 @@ wss.on('connection', media => {
     const length = playbackReady ? Math.min(160, queue.length) : 0;
     const frame = Buffer.alloc(160, 0xff);
     queue.copy(frame, 0, 0, length); queue = queue.subarray(length);
+    if(length)outputQueueGuard.drained(queue.length);
     const speech = pcmuHasSpeech(frame);
     if (speech) {
       lastSpeechPlaybackAt = performance.now();
@@ -608,9 +619,10 @@ wss.on('connection', media => {
       const invoiceCall = outbound?.purpose === 'overdue_invoice';
       const ownerCall=outbound?.purpose==='owner_requested';
       const ownerNotificationCall=outbound?.purpose==='owner_notification';
-      const focusedOutbound=invoiceCall||ownerCall||ownerNotificationCall;
-      const customerOutbound=!!outbound&&!ownerNotificationCall;
-      if (outbound) callRecord.callback(outbound.attemptId,ownerCall||ownerNotificationCall);
+      const quotationCall=outbound?.purpose==='quotation_followup';
+      const focusedOutbound=invoiceCall||ownerCall||ownerNotificationCall||quotationCall;
+      const customerOutbound=!!outbound&&!ownerNotificationCall&&!quotationCall;
+      if (outbound) callRecord.callback(outbound.attemptId,ownerCall||ownerNotificationCall,quotationCall);
       if (callbackToken && !outbound) return finish('invalid callback media token');
       try { businessConfig = outbound?.route ?? await resolveMediaStartRoute(event, tenantRoutes); }
       catch (error) {
@@ -650,7 +662,7 @@ wss.on('connection', media => {
         'After they confirm they are the intended contact and can speak, say you are calling about an overdue invoice. Ask if they have received it and whether they expect to pay or need someone from the business to help.',
         'If the intended contact is busy, follow the callback request instructions. If they say it was paid or dispute it, thank them and say you will pass that on. Do not request payment credentials, share bank details or amounts, take payment, or agree to a payment plan. Then say goodbye.',
       ].join(' ') : '';
-      const focusedInstructions=ownerNotificationCall?ownerInspectionNotificationInstructions(outbound,discoveredProfile?.businessName):ownerCall?ownerRequestedCallInstructions(outbound,discoveredProfile?.businessName):invoiceInstructions;
+      const focusedInstructions=quotationCall?quotationFollowUpInstructions(outbound,discoveredProfile?.businessName):ownerNotificationCall?ownerInspectionNotificationInstructions(outbound,discoveredProfile?.businessName):ownerCall?ownerRequestedCallInstructions(outbound,discoveredProfile?.businessName):invoiceInstructions;
       let greetFirst = false;
       if (!focusedOutbound && businessConfig.mode === 'trade' && typeof discoveredProfile?.businessName === 'string' &&
           discoveredProfile.businessName.trim() && typeof discoveredProfile.timezone === 'string') {
@@ -739,9 +751,10 @@ wss.on('connection', media => {
         backendReadyAt = performance.now();
         const inspectionDetails = ownerNotificationCall ? ownerInspectionDetailsTool(businessConfig,outbound) : undefined;
         const ownerBriefing = ownerNotificationCall ? await openOwnerPhoneBriefing(businessConfig,outbound) : undefined;
+        const quoteSession=quotationCall?createQuotationFollowUpSession(businessConfig,outbound):undefined;
         if(closing)return;
-        businessSession = {tools: [...(inspectionDetails ? [inspectionDetails.tool] : []),...(ownerBriefing?.tools??[])],
-          call:async(name,args)=>name==='get_notified_inspection'&&inspectionDetails?inspectionDetails.call(name,args):ownerBriefing?.call(name,args),
+        businessSession = {tools: [...(inspectionDetails ? [inspectionDetails.tool] : []),...(ownerBriefing?.tools??[]),...(quoteSession?.tools??[])],
+          call:async(name,args)=>quoteSession?quoteSession.call(name,args):name==='get_notified_inspection'&&inspectionDetails?inspectionDetails.call(name,args):ownerBriefing?.call(name,args),
           close: async () => {}, profile: {businessId: businessConfig.businessId},
           voiceInstructions: focusedInstructions, backendInstructions: focusedInstructions};
         toolsEnabled = true;
@@ -758,7 +771,7 @@ wss.on('connection', media => {
 
          // ---- Step 3: pick the fixed Sophie greeting for this mode ---- 
       const greeting = focusedOutbound
-        ? ownerNotificationCall ? `Say exactly: ${ownerPhoneGreeting(outbound.customerName)} Then listen. Keep the reason private until they confirm they can speak.` : 'Introduce yourself and ask to speak with the intended contact. Keep the reason for the call private until they confirm.'
+        ? ownerNotificationCall ? `Say exactly: ${ownerPhoneGreeting(outbound.customerName)} Then listen. Keep the reason private until they confirm they can speak.` : ownerCall ? `Say this greeting, then listen: ${ownerRequestedCallGreeting(outbound,discoveredProfile?.businessName || businessConfig.businessName)}` : 'Introduce yourself and ask to speak with the intended contact. Keep the reason for the call private until they confirm.'
         : isOwnerCandidate(businessConfig.phoneCallerAccess)
         ? `Say this greeting exactly, then listen: ${OWNER_INBOUND_GREETING}`
         : outbound
@@ -821,6 +834,7 @@ wss.on('connection', media => {
         if (event.type === 'session.caller_speech.started') {
           synthesisBuffering=false; synthesisComplete=false;
           queue = Buffer.alloc(0);
+          outputQueueGuard.clear();
           draftTyping.stop();
           command('FLUSH_MEDIA'); leadSent = false;
           hangup.cancel();
@@ -921,7 +935,8 @@ wss.on('connection', media => {
             callRecord.setup(firstAudioAt - setupStartedAt);
             log(`Audible greeting audio ready; answered call. greetingGenerationMs=${Math.round(firstAudioAt - liveReadyAt)} totalSetupMs=${Math.round(firstAudioAt - setupStartedAt)}`);
           }
-          if (queue.length + chunk.length > 80000) return finish('output backlog exceeded ten seconds');
+          const outputFailure=outputQueueGuard.append(queue.length,chunk.length);
+          if(outputFailure)return finish(outputFailure);
           queue = Buffer.concat([queue, chunk]);
         }
       });
