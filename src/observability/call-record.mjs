@@ -10,7 +10,7 @@ const MAX_TURNS = 500;          // conversation turns kept per call
 const MAX_TURN_CHARS = 4000;    // per turn
 const MAX_TOTAL_CHARS = 60000;  // whole conversation
 const MAX_TOOLS = 100;
-const OUTCOME_TOOLS = new Set(['create_inspection_request', 'create_job_booking', 'reschedule_job', 'cancel_job', 'register_customer']);
+const OUTCOME_TOOLS = new Set(['create_inspection_request', 'create_job_booking', 'reschedule_job', 'cancel_job', 'register_customer','record_quotation_decision']);
 
 const speakers = new Map([
   ['session.input_transcript.delta', 'caller'],
@@ -26,11 +26,13 @@ export function createCallRecord({callId, now = () => Date.now()}) {
   let last;   // {speaker, endMs} of the latest fragment, to merge fragments into turns
   let callbackAttemptId;
   let ownerScheduledCall=false;
+  let quotationFollowUpCall=false;
 
   return {
-    callback(id,ownerRequested=false) {
+    callback(id,ownerRequested=false,quotation=false) {
       if (typeof id === 'string' && /^[a-f0-9]{64}$/.test(id)) callbackAttemptId = id;
       ownerScheduledCall=ownerRequested===true;
+      quotationFollowUpCall=quotation===true;
     },
     /** Same OpenAI transcript events the transcript file uses; fragments are merged into turns. */
     event(event) {
@@ -60,8 +62,9 @@ export function createCallRecord({callId, now = () => Date.now()}) {
     tool(name, result, durationMs) {
       if (tools.length < MAX_TOOLS) tools.push({name: safeCode(name), status: safeCode(result?.status || 'completed'), durationMs: Math.max(0, Math.round(durationMs || 0))});
       if (OUTCOME_TOOLS.has(name) && outcomes.length < 10) {
-        outcomes.push({tool: safeCode(name), status: safeCode(result?.status),
-          reference: reference(result?.requestId) ?? reference(result?.jobCode) ?? reference(result?.customerId)});
+        const decisionStatus=name==='record_quotation_decision'&&result?.status==='RECORDED'&&['accepted','rejected'].includes(result.decision)?result.decision.toUpperCase():result?.status;
+        outcomes.push({tool: safeCode(name), status: safeCode(decisionStatus),
+          reference: reference(result?.requestId) ?? reference(result?.jobCode) ?? reference(result?.customerId) ?? reference(result?.quotationId)});
       }
     },
     end(reason) {
@@ -83,6 +86,7 @@ export function createCallRecord({callId, now = () => Date.now()}) {
         callerNumber,
         ...(callbackAttemptId && {callbackAttemptId}),
         ...(callbackAttemptId&&ownerScheduledCall?{ownerScheduledCall:true}:{}),
+        ...(callbackAttemptId&&quotationFollowUpCall?{quotationFollowUpCall:true}:{}),
         tools,
         outcomes,
         transcript: turns.map(turn => ({...turn, text: turn.text.trim()})).filter(turn => turn.text.length),
