@@ -102,6 +102,23 @@ test('owner visit preparation and confirmation tools pass the bridge whitelist',
  assert.equal(response.status,200);assert.equal(upstream.mock.callCount(),1);
 });
 
+test('bridge accepts the Sophie email assistant tools',async(t)=>{
+ const secret='trade-bridge-test-secret-0000000000000000';
+ const upstream=t.mock.fn(async()=>new Response('v=0\r\no=answer'));
+ const server=createServer(createOwnerVoiceHandler({secret,apiKey:'fixture-key',fetcher:upstream}));
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ t.after(()=>new Promise(resolve=>server.close(resolve)));
+ const start=(names)=>fetch(`http://127.0.0.1:${server.address().port}/owner-voice/session`,{
+  method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${secret}`},
+  body:JSON.stringify({sdp:'v=0\r\no=fixture',safetyIdentifier:'d'.repeat(64),session:{instructions:'Owner email assistant.',tools:names.map(name=>({type:'function',name}))}}),
+ });
+ const names=['get_email_summary','get_email_questions','answer_email_question','get_email_rules','set_email_rule_level','pause_email_automation','get_open_complaints','prepare_return_visit_policy','confirm_owner_change','cancel_owner_change'];
+ assert.equal((await start(names)).status,200);
+ assert.equal(upstream.mock.callCount(),1);
+ assert.equal((await start([...names,'approve_email_rule'])).status,400,'there is no voice tool that approves a rule');
+ assert.equal(upstream.mock.callCount(),1);
+});
+
 test('bridge exposes fixed validation codes and rejects invalid setup before contacting OpenAI',async(t)=>{
  const secret='trade-bridge-test-secret-0000000000000000';
  const upstream=t.mock.fn(async()=>new Response(null,{status:403}));

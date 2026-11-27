@@ -152,6 +152,16 @@ const toolNames = new Set([
   'prepare_email_send',
   'prepare_email_trash',
   'prepare_email_retry',
+  // Sophie's email assistant (emails waiting for a decision, her rules, complaints). Run on Trade's owner MCP route;
+  // answering a card uses confirm_owner_change. A new rule is never approved by voice: that is done in the app.
+  'get_email_summary',
+  'get_email_questions',
+  'answer_email_question',
+  'get_email_rules',
+  'set_email_rule_level',
+  'pause_email_automation',
+  'get_open_complaints',
+  'prepare_return_visit_policy',
 ]);
 
 /** The tool list is valid only if every tool is a known function, with no repeats and none unknown. */
