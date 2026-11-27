@@ -117,9 +117,22 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
 
   const expected = Buffer.from(`Bearer ${bridgeSecret}`);
   const attempts = new Map();
+  const results = new Map();
   const media = new Map();
   let dialing = false;
   return {
+    status(request,response) {
+      const send=(code,body)=>{response.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store'});response.end(JSON.stringify(body));};
+      const actual=Buffer.from(request.headers.authorization??'');
+      if(request.method!=='GET')return send(405,{});
+      if(actual.length!==expected.length||!timingSafeEqual(actual,expected))return send(401,{});
+      const url=new URL(request.url,'http://localhost');
+      const id=url.searchParams.get('id'),did=url.searchParams.get('did'),businessId=url.searchParams.get('businessId');
+      if(!/^[a-f0-9]{64}$/.test(id??'')||!/^\d{6,15}$/.test(did??'')||!businessId||businessId.length>128)return send(400,{});
+      const row=results.get(id);
+      if(!row||row.did!==did||row.businessId!==businessId)return send(404,{status:'NOT_FOUND'});
+      return send(200,{id,status:row.status,...(row.code?{code:row.code}:{}),...(row.reason?{reason:row.reason}:{})});
+    },
     take(token) {
       const entry = media.get(token);
       media.delete(token);
@@ -168,7 +181,11 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
       if(purpose==='owner_notification'&&(!input.ownerNotification||typeof input.ownerNotification.requestCode!=='string'||!/^[-A-Za-z0-9 _]{1,80}$/.test(input.ownerNotification.requestCode)))return send(400,{});
       if(purpose==='quotation_followup'&&(!input.quotationFollowUp||typeof input.quotationFollowUp.quotationCode!=='string'||!/^[-A-Za-z0-9 _]{1,80}$/.test(input.quotationFollowUp.quotationCode)))return send(400,{});
       const existing = attempts.get(input.id);
-      if (existing) return send(200, await existing);
+      if (existing) {
+        const stored=results.get(input.id);
+        if(stored?.businessId!==input.businessId||stored.did!==input.did)return send(409,{});
+        return send(200, await existing);
+      }
       if (dialing || !hasCapacity() || attempts.size >= 100) return send(429, {});
       dialing = true;
       const attempt = (async () => {
@@ -221,6 +238,7 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
       })()
         .catch(() => ({status: 'FAILED', code: 'CALLBACK_INTERNAL_ERROR'}))
         .then(result => {
+          results.set(input.id,{businessId:input.businessId,did:input.did,...result});
           console.info(
             `[sophie-callback] id=${input.id.slice(0, 8)} status=${result.status} code=${result.code}${result.reason ? ` reason=${result.reason}` : ''}`,
           );
@@ -230,7 +248,8 @@ export function createSophieCallback({env, bridgeSecret, resolveRoute, hasCapaci
           dialing = false;
         });
       attempts.set(input.id, attempt);
-      setTimeout(() => attempts.delete(input.id), 60 * 60_000).unref();
+      results.set(input.id,{businessId:input.businessId,did:input.did,status:'REQUESTED'});
+      setTimeout(() => {attempts.delete(input.id);results.delete(input.id);}, 60 * 60_000).unref();
       return send(200, await attempt);
     },
   };
